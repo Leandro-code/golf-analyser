@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import cv2
+import numpy as np
 from streamlit.testing.v1 import AppTest
 
 from analysis.assessment import assess_swing
@@ -43,6 +45,16 @@ def _write_assessed_run(tmp_path, detection_method: str = "test"):
     (run_dir / "original.mp4").write_bytes(b"")
     (run_dir / "annotated.mp4").write_bytes(b"")
     (run_dir / "keyframes").mkdir()
+    for name in (
+        "address.jpg",
+        "top_of_backswing.jpg",
+        "impact_approximation.jpg",
+        "finish.jpg",
+    ):
+        assert cv2.imwrite(
+            str(run_dir / "keyframes" / name),
+            np.full((8, 8, 3), 245, dtype=np.uint8),
+        )
     (run_dir / "landmarks.json").write_text(
         json.dumps(
             {
@@ -68,7 +80,7 @@ def _write_assessed_run(tmp_path, detection_method: str = "test"):
     return run_dir
 
 
-def test_history_renders_improvement_findings_for_assessed_run(tmp_path, monkeypatch):
+def test_history_renders_measured_pose_data_for_assessed_run(tmp_path, monkeypatch):
     _write_assessed_run(tmp_path)
     monkeypatch.setenv("GOLF_ANALYSER_OUTPUTS_DIR", str(tmp_path))
 
@@ -76,8 +88,22 @@ def test_history_renders_improvement_findings_for_assessed_run(tmp_path, monkeyp
     app.segmented_control[0].set_value("History").run(timeout=10)
 
     assert not app.exception
-    assert any("Swing tempo" in warning.value for warning in app.warning)
+    assert any("Measured Pose Data" in expander.label for expander in app.expander)
     assert any(button.label == "Re-run automatic phase detection" for button in app.button)
+
+
+def test_history_offers_primary_opt_in_ai_swing_assessment(tmp_path, monkeypatch):
+    _write_assessed_run(tmp_path)
+    monkeypatch.setenv("GOLF_ANALYSER_OUTPUTS_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    app = AppTest.from_file("app/streamlit_app.py").run(timeout=10)
+    app.segmented_control[0].set_value("History").run(timeout=10)
+
+    assert not app.exception
+    assert any(button.label == "Generate AI swing assessment" for button in app.button)
+    assert any("Model-generated swing assessment" in item.value for item in app.caption)
+    assert any("Measured Pose Data" in expander.label for expander in app.expander)
 
 
 def test_history_withholds_guidance_from_superseded_phase_detection(tmp_path, monkeypatch):
@@ -121,4 +147,4 @@ def test_history_explains_legacy_run_without_assessment(tmp_path, monkeypatch):
     app.segmented_control[0].set_value("History").run(timeout=10)
 
     assert not app.exception
-    assert any("capture context was not recorded" in info.value for info in app.info)
+    assert any("requires a contextual analysis" in info.value for info in app.info)

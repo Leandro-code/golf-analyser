@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This repository is a local-first Python/Streamlit workbench for testing golf swing video analysis before any API or Android implementation. A user uploads a full-swing video, supplies capture context, receives an annotated replay, swing phases, metrics, and evidence-based improvement findings, and can reopen saved runs.
+This repository is a local-first Python/Streamlit workbench for testing golf swing video analysis before any API or Android implementation. A user uploads a full-swing video, supplies capture context, receives an annotated replay, swing phases, raw metrics, optional LLM-led swing assessment, and can reopen saved runs.
 
-The system is deliberately deterministic and explainable. It does not provide AI-generated coaching, a swing score, clubface/path analysis, ball-strike conclusions, ball-flight analysis, pro comparison, accounts, or cloud deployment.
+The system keeps phase timing, pose metrics, and quality gates deterministic and explainable. It can optionally request an LLM-led swing assessment from trusted still images and raw local pose measurements. It does not provide a swing score, clubface/path analysis, ball-strike conclusions, ball-flight analysis, pro comparison, accounts, or cloud deployment.
 
 ## Environment And Commands
 
@@ -24,9 +24,11 @@ Do not remove or overwrite user analysis runs in `outputs/` unless explicitly as
 - `analysis/pose.py`: MediaPipe Pose Landmarker wrapper; provides body landmarks, not golf-phase understanding.
 - `analysis/phases.py`: ordered swing-phase detection and manual confirmed-marker construction.
 - `analysis/metrics.py`: deterministic pose metrics and quality metadata.
-- `analysis/assessment.py`: applies the technique rubric and suppresses untrustworthy findings.
+- `analysis/assessment.py`: legacy/reference rubric checks and quality-limit construction; do not feed its target ranges to the primary LLM assessment.
+- `analysis/llm_assessment.py`: opt-in OpenAI swing-assessment request, submitted-frame export, evidence fingerprinting, and persisted primary model output.
+- `analysis/ai_review.py`: legacy supplementary OpenAI visual-review request/loading compatibility.
 - `analysis/rubric.v1.json`: versioned reference rules, thresholds, correction cues, and source attribution.
-- `analysis/visualise.py`: pose overlays, phase labels, evidence/keyframe exports, annotated replay rendering.
+- `analysis/visualise.py`: pose overlays, phase labels, evidence/keyframe exports, browser-compatible annotated replay rendering and legacy playback transcoding.
 - `analysis/storage.py`: reloads persisted analysis runs while supporting older runs without assessments.
 - `analysis/models.py`: Pydantic models for the persisted/result contracts.
 
@@ -55,6 +57,9 @@ outputs/swing_<timestamp>/
   metrics.json
   phases.json
   assessment.json
+  llm_assessment.json   # only after an explicit AI swing assessment request
+  llm_frames/           # exact still images submitted to the LLM
+  ai_review.json        # legacy optional supplementary review artifact
   keyframes/
 ```
 
@@ -72,13 +77,15 @@ MediaPipe tracks body landmarks only. The project's own phase logic determines g
 - Phase-specific findings must use evidence from their stated phase. For example, impact head stability must point at the impact marker, not a maximum head movement at finish.
 - Keep the `phase_scoped_metrics` quality marker; saved assessed runs lacking it are considered stale and must not show coaching until regenerated.
 - Preserve quality gating: missing/weak pose evidence or invalid timing yields `insufficient_data`, not a corrective finding.
+- LLM swing assessment remains user-triggered and must use the same timing/evidence gating; changed phase evidence makes any saved model assessment stale until regenerated.
 
 ## Assessment Boundaries
 
-- Rubric rules are data-driven in `analysis/rubric.v1.json`; do not hard-code thresholds or coaching text in Streamlit.
-- Findings can include observed pose metric, reference range, evidence frame, confidence, rationale, and a concise correction cue.
+- Rubric rules are data-driven in `analysis/rubric.v1.json`; do not hard-code thresholds or sourced reference text in Streamlit.
+- Legacy rubric findings can include observed pose metric, reference range, evidence frame, confidence, rationale, and a concise correction cue.
 - Any new rubric claim needs an attributable source and should be framed as a 2D pose proxy when it is not a directly validated measurement.
 - Do not claim the pipeline knows club path, clubface angle, contact quality, shot outcome, power, or overall technique quality without a new validated signal.
+- Model-generated assessment must not receive deterministic reference ranges or rubric correction cues; it should use selected frames, raw local pose measurements, and quality metadata only.
 
 ## Testing Expectations
 
@@ -95,4 +102,3 @@ Existing regression coverage includes:
 - legacy and assessed history rendering.
 
 When modifying timing behavior, validate against the saved failure pattern where a finish frame was previously labelled as backswing/impact, while avoiding mutation of user output artifacts unless the requested task is to regenerate them.
-

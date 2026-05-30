@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class VideoMetadata(BaseModel):
@@ -98,6 +98,94 @@ class SwingAssessment(BaseModel):
     quality_limitations: list[str] = Field(default_factory=list)
 
 
+class AIReviewObservation(BaseModel):
+    phase_name: str
+    observation: str
+    evidence_visible: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    related_metric_key: str | None = None
+
+
+class AIReviewPriority(BaseModel):
+    focus: str
+    practice_cue: str
+    supporting_phases: list[str] = Field(default_factory=list)
+
+
+class AIReviewContent(BaseModel):
+    summary: str
+    observations: list[AIReviewObservation] = Field(default_factory=list)
+    priorities: list[AIReviewPriority] = Field(default_factory=list, max_length=3)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class AIVisualReview(BaseModel):
+    schema_version: str
+    prompt_version: str
+    model: str
+    generated_at: str
+    context: AnalysisContext
+    reviewed_phases: list[SwingPhase] = Field(default_factory=list)
+    quality_snapshot: dict[str, Any] = Field(default_factory=dict)
+    evidence_fingerprint: str
+    content: AIReviewContent
+
+
+class SubmittedEvidenceFrame(BaseModel):
+    frame_id: str
+    frame_index: int
+    timestamp_seconds: float
+    phase_relations: list[str] = Field(default_factory=list)
+    image_file: str
+
+
+class LLMObservation(BaseModel):
+    title: str
+    observation: str
+    supporting_frame_ids: list[str] = Field(default_factory=list)
+    related_metric_keys: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class LLMPriority(BaseModel):
+    title: str
+    rationale: str
+    practice_cue: str
+    supporting_frame_ids: list[str] = Field(default_factory=list)
+    related_metric_keys: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+    support_type: Literal["ai_generated"] = "ai_generated"
+
+    @field_validator("support_type", mode="before")
+    @classmethod
+    def _normalize_legacy_support_type(cls, value: object) -> str:
+        # Older saved LLM assessments used sourced_reference before the primary
+        # assessment stopped sending deterministic reference ranges.
+        if value == "sourced_reference":
+            return "ai_generated"
+        return "ai_generated" if value is None else str(value)
+
+
+class LLMAssessmentContent(BaseModel):
+    overview: str
+    strengths: list[str] = Field(default_factory=list)
+    observations: list[LLMObservation] = Field(default_factory=list)
+    priorities: list[LLMPriority] = Field(default_factory=list, max_length=3)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class LLMAssessment(BaseModel):
+    schema_version: str
+    prompt_version: str
+    model: str
+    generated_at: str
+    context: AnalysisContext
+    submitted_frames: list[SubmittedEvidenceFrame] = Field(default_factory=list)
+    quality_snapshot: dict[str, Any] = Field(default_factory=dict)
+    evidence_fingerprint: str
+    content: LLMAssessmentContent
+
+
 class AnalysisArtifacts(BaseModel):
     output_dir: Path
     original_video: Path
@@ -107,6 +195,9 @@ class AnalysisArtifacts(BaseModel):
     phases_json: Path
     keyframes_dir: Path
     assessment_json: Path | None = None
+    ai_review_json: Path | None = None
+    llm_assessment_json: Path | None = None
+    llm_frames_dir: Path | None = None
 
 
 class AnalysisResult(BaseModel):
@@ -116,3 +207,5 @@ class AnalysisResult(BaseModel):
     metrics: MetricSet
     artifacts: AnalysisArtifacts
     assessment: SwingAssessment | None = None
+    ai_review: AIVisualReview | None = None
+    llm_assessment: LLMAssessment | None = None

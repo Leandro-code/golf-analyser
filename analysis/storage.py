@@ -6,6 +6,8 @@ from pathlib import Path
 from analysis.models import (
     AnalysisArtifacts,
     AnalysisResult,
+    AIVisualReview,
+    LLMAssessment,
     LandmarkFrame,
     MetricSet,
     SwingAssessment,
@@ -56,6 +58,16 @@ def load_analysis_result(output_dir: Path) -> AnalysisResult:
         if artifacts.assessment_json and artifacts.assessment_json.exists()
         else None
     )
+    ai_review = (
+        AIVisualReview.model_validate(_read_json(artifacts.ai_review_json))
+        if artifacts.ai_review_json and artifacts.ai_review_json.exists()
+        else None
+    )
+    llm_assessment = (
+        LLMAssessment.model_validate(_read_json(artifacts.llm_assessment_json))
+        if artifacts.llm_assessment_json and artifacts.llm_assessment_json.exists()
+        else None
+    )
 
     return AnalysisResult(
         metadata=VideoMetadata.model_validate(landmarks_payload["metadata"]),
@@ -70,6 +82,8 @@ def load_analysis_result(output_dir: Path) -> AnalysisResult:
         metrics=MetricSet.model_validate(metrics_payload),
         artifacts=artifacts,
         assessment=assessment,
+        ai_review=ai_review,
+        llm_assessment=llm_assessment,
     )
 
 
@@ -85,6 +99,24 @@ def _artifacts(output_dir: Path) -> AnalysisArtifacts:
         assessment_json=(
             output_dir / "assessment.json"
             if (output_dir / "assessment.json").exists()
+            else None
+        ),
+        ai_review_json=(
+            output_dir / "ai_review.json"
+            if (output_dir / "assessment.json").exists()
+            or (output_dir / "ai_review.json").exists()
+            else None
+        ),
+        llm_assessment_json=(
+            output_dir / "llm_assessment.json"
+            if (output_dir / "assessment.json").exists()
+            or (output_dir / "llm_assessment.json").exists()
+            else None
+        ),
+        llm_frames_dir=(
+            output_dir / "llm_frames"
+            if (output_dir / "assessment.json").exists()
+            or (output_dir / "llm_frames").exists()
             else None
         ),
     )

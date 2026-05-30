@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from analysis import AnalysisContext, SwingAnalyser, list_analysis_runs, load_analysis_result
+from analysis.visualise import browser_playback_video
 
 
 def test_analyser_creates_expected_outputs(tmp_path):
@@ -24,6 +25,7 @@ def test_analyser_creates_expected_outputs(tmp_path):
     assert result.artifacts.metrics_json.exists()
     assert result.artifacts.phases_json.exists()
     assert result.artifacts.keyframes_dir.exists()
+    assert _video_fourcc(result.artifacts.annotated_video) in {"avc1", "h264", "H264"}
     assert len(result.landmarks) == 5
     assert len(result.phases) == 7
 
@@ -73,6 +75,18 @@ def test_list_analysis_runs_excludes_incomplete_directories(tmp_path):
     assert list_analysis_runs(tmp_path) == []
 
 
+def test_browser_playback_transcodes_existing_opencv_video_without_rewriting_source(tmp_path):
+    legacy_video = tmp_path / "legacy.mp4"
+    _write_blank_video(legacy_video)
+    source_bytes = legacy_video.read_bytes()
+
+    playback_video = browser_playback_video(legacy_video)
+
+    assert playback_video != legacy_video
+    assert legacy_video.read_bytes() == source_bytes
+    assert _video_fourcc(playback_video) in {"avc1", "h264", "H264"}
+
+
 def _write_blank_video(path):
     writer = cv2.VideoWriter(
         str(path),
@@ -85,3 +99,11 @@ def _write_blank_video(path):
         frame = np.full((64, 64, 3), 245, dtype=np.uint8)
         writer.write(frame)
     writer.release()
+
+
+def _video_fourcc(path):
+    cap = cv2.VideoCapture(str(path))
+    assert cap.isOpened()
+    code = int(cap.get(cv2.CAP_PROP_FOURCC))
+    cap.release()
+    return "".join(chr((code >> (8 * index)) & 0xFF) for index in range(4))

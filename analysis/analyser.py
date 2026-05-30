@@ -43,6 +43,9 @@ class SwingAnalyser:
         metrics_json = output_dir / "metrics.json"
         phases_json = output_dir / "phases.json"
         assessment_json = output_dir / "assessment.json" if context else None
+        ai_review_json = output_dir / "ai_review.json" if context else None
+        llm_assessment_json = output_dir / "llm_assessment.json" if context else None
+        llm_frames_dir = output_dir / "llm_frames" if context else None
 
         _report(progress_callback, "Copying source video", 0.05)
         if video_path.resolve() != original_video.resolve():
@@ -79,6 +82,9 @@ class SwingAnalyser:
             phases_json=phases_json,
             keyframes_dir=keyframes_dir,
             assessment_json=assessment_json,
+            ai_review_json=ai_review_json,
+            llm_assessment_json=llm_assessment_json,
+            llm_frames_dir=llm_frames_dir,
         )
         result = AnalysisResult(
             metadata=metadata,

@@ -1,7 +1,9 @@
 mediapipe
 opencv-python
+imageio-ffmpeg
 numpy
 streamlit
 pydantic
 pytest
-
+openai
+python-dotenv
