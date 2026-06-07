@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from analysis.phases import PHASE_NAMES, build_confirmed_phases, detect_swing_phases, phase_quality_issues
+from analysis.phases import (
+    PHASE_NAMES,
+    _first_backswing_reversal,
+    build_confirmed_phases,
+    detect_swing_phases,
+    phase_quality_issues,
+)
 
 
 def test_detect_swing_phases_from_wrist_trajectory(frame):
@@ -63,6 +69,95 @@ def test_finish_hands_higher_than_backswing_does_not_become_top(frame):
 
     assert phase_by_name["Top of backswing"].frame_index < phase_by_name["Impact approximation"].frame_index
     assert phase_by_name["Top of backswing"].frame_index < 17
+
+
+def test_flat_backswing_transition_uses_first_sustained_reversal():
+    y_values = [
+        0.444,
+        0.404,
+        0.395,
+        0.386,
+        0.376,
+        0.358,
+        0.337,
+        0.314,
+        0.289,
+        0.264,
+        0.252,
+        0.245,
+        0.244,
+        0.244,
+        0.246,
+        0.248,
+        0.248,
+        0.248,
+        0.253,
+        0.257,
+    ]
+    points = [
+        (frame_index, 0.5, y)
+        for frame_index, y in enumerate(y_values, start=71)
+    ]
+
+    candidate = _first_backswing_reversal(points, points[0])
+
+    assert candidate is not None
+    point, method, confidence = candidate
+    assert point[0] == 82
+    assert method == "first_sustained_wrist_reversal"
+    assert confidence == 0.72
+
+
+def test_observed_gradual_top_shape_detects_ordered_sequence(frame):
+    wrist_points = [
+        (0.339459, 0.446136), (0.336157, 0.440083),
+        (0.332210, 0.434049), (0.323544, 0.429206),
+        (0.300373, 0.418117), (0.283911, 0.413779),
+        (0.272804, 0.404682), (0.261199, 0.393977),
+        (0.260364, 0.387297), (0.254663, 0.377468),
+        (0.241072, 0.367292), (0.235214, 0.353547),
+        (0.136320, 0.302524), (0.130974, 0.286363),
+        (0.123424, 0.260149), (0.121188, 0.240546),
+        (0.126536, 0.232542), (0.135200, 0.238739),
+        (0.150674, 0.253025), (0.157673, 0.253818),
+        (0.165843, 0.241966), (0.172539, 0.240969),
+        (0.176698, 0.250784), (0.179416, 0.253754),
+        (0.191664, 0.254668), (0.195403, 0.262972),
+        (0.199619, 0.262788), (0.205903, 0.263285),
+        (0.232938, 0.291695), (0.302966, 0.322368),
+        (0.364494, 0.368973), (0.421628, 0.401717),
+        (0.456222, 0.407207), (0.429561, 0.397552),
+        (0.356505, 0.328452), (0.325737, 0.319413),
+        (0.261187, 0.264345), (0.194492, 0.239980),
+        (0.166840, 0.239083), (0.168102, 0.231206),
+        (0.163969, 0.231949), (0.159385, 0.211473),
+        (0.172032, 0.201308), (0.173433, 0.200058),
+        (0.185804, 0.198698), (0.191071, 0.199185),
+        (0.192951, 0.204224), (0.202420, 0.205976),
+        (0.190234, 0.204367), (0.186856, 0.204042),
+        (0.188767, 0.203120), (0.185697, 0.205222),
+        (0.293700, 0.253085), (0.333301, 0.269662),
+        (0.396256, 0.283051), (0.397808, 0.275568),
+        (0.375635, 0.267488),
+    ]
+    wrist_points = [wrist_points[0]] * 5 + wrist_points
+    frames = [
+        frame(index, left_wrist=point, right_wrist=point)
+        for index, point in enumerate(wrist_points)
+    ]
+
+    phases = detect_swing_phases(frames, fps=30)
+    phase_by_name = {phase.name: phase for phase in phases}
+
+    assert phase_quality_issues(phases, fps=30) == []
+    assert phase_by_name["Top of backswing"].detection_method == "first_sustained_wrist_reversal"
+    assert phase_by_name["Address"].frame_index < phase_by_name["Top of backswing"].frame_index
+    assert phase_by_name["Top of backswing"].frame_index < phase_by_name["Impact approximation"].frame_index
+    assert phase_by_name["Impact approximation"].frame_index < phase_by_name["Finish"].frame_index
+    assert not any(
+        phase.detection_method.startswith("no_")
+        for phase in phases
+    )
 
 
 def test_user_confirmed_markers_bypass_automatic_timing_warning():

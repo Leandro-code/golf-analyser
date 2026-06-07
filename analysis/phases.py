@@ -26,9 +26,10 @@ def detect_swing_phases(
     address_idx = _active_address_index(points)
     active = [point for point in points if point[0] >= address_idx]
     address = active[0]
-    top = _first_backswing_reversal(active, address)
-    if top is None:
+    top_result = _first_backswing_reversal(active, address)
+    if top_result is None:
         return _fallback_phases(landmark_frames, fps, "no_ordered_backswing_reversal")
+    top, top_method, top_confidence = top_result
     impact = _first_impact_return(active, address, top)
     if impact is None:
         return _fallback_phases(landmark_frames, fps, "no_ordered_impact_return")
@@ -46,13 +47,13 @@ def detect_swing_phases(
     methods = [
         "detected_stable_address_before_motion",
         "ordered_address_to_top",
-        "first_qualified_wrist_direction_reversal",
+        top_method,
         "ordered_top_to_impact",
         "first_post_top_strike_region_transition",
         "ordered_impact_to_finish",
         "first_post_impact_high_hands_position",
     ]
-    confidences = [0.72, 0.68, 0.78, 0.7, 0.72, 0.66, 0.68]
+    confidences = [0.72, 0.68, top_confidence, 0.7, 0.72, 0.66, 0.68]
     return [
         SwingPhase(
             name=name,
@@ -212,9 +213,12 @@ def _active_address_index(points: list[tuple[int, float, float]]) -> int:
 def _first_backswing_reversal(
     points: list[tuple[int, float, float]],
     address: tuple[int, float, float],
-) -> tuple[int, float, float] | None:
+) -> tuple[tuple[int, float, float], str, float] | None:
     if len(points) < 5:
-        return min(points, key=lambda point: point[2]) if points else None
+        candidate = min(points, key=lambda point: point[2]) if points else None
+        if candidate is None:
+            return None
+        return candidate, "minimum_wrist_y_from_short_sequence", 0.62
     for index in range(2, len(points) - 2):
         candidate = points[index]
         if address[2] - candidate[2] < 0.04:
@@ -228,7 +232,30 @@ def _first_backswing_reversal(
             for offset in range(index, index + 2)
         )
         if before < 0 and after > 0.006:
-            return candidate
+            return candidate, "first_qualified_wrist_direction_reversal", 0.78
+    return _first_sustained_backswing_reversal(points, address)
+
+
+def _first_sustained_backswing_reversal(
+    points: list[tuple[int, float, float]],
+    address: tuple[int, float, float],
+    lookahead: int = 6,
+) -> tuple[tuple[int, float, float], str, float] | None:
+    if len(points) <= lookahead + 2:
+        return None
+    for index in range(2, len(points) - lookahead):
+        candidate = points[index]
+        if address[2] - candidate[2] < 0.04:
+            continue
+        before = sum(
+            points[offset][2] - points[offset - 1][2]
+            for offset in range(max(1, index - 4), index + 1)
+        )
+        future_highest_y = max(
+            point[2] for point in points[index + 1 : index + lookahead + 1]
+        )
+        if before < -0.01 and future_highest_y - candidate[2] >= 0.003:
+            return candidate, "first_sustained_wrist_reversal", 0.72
     return None
 
 

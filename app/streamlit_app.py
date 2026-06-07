@@ -27,11 +27,15 @@ from analysis.visualise import browser_playback_video
 
 load_dotenv(PROJECT_ROOT / ".env")
 OUTPUTS_DIR = Path(os.environ.get("GOLF_ANALYSER_OUTPUTS_DIR", PROJECT_ROOT / "outputs"))
+ASSESSMENT_EVIDENCE_IMAGE_WIDTH = 220
+KEYFRAME_IMAGE_WIDTH = 240
+MAX_REPLAY_VIDEO_HEIGHT = 560
+MAX_REPLAY_VIDEO_WIDTH = 760
 
 
 def main() -> None:
-    st.set_page_config(page_title="Golf Swing Analysis Workbench", layout="wide")
-    st.title("Golf Swing Analysis Workbench")
+    st.set_page_config(page_title="AI Swing Review", layout="wide")
+    st.title("AI Swing Review")
 
     view = st.segmented_control(
         "Workspace view",
@@ -57,7 +61,14 @@ def main() -> None:
         _render_result(result, f"Saved analysis: {_run_label(selected_run)}")
         return
 
-    st.subheader("Capture Context")
+    st.subheader("Review a new swing")
+    uploaded = st.file_uploader(
+        "Upload a golf swing video",
+        type=["mp4", "mov", "m4v", "avi"],
+        accept_multiple_files=False,
+    )
+
+    st.markdown("**Capture details**")
     context_columns = st.columns(3)
     with context_columns[0]:
         handedness = st.selectbox(
@@ -77,16 +88,11 @@ def main() -> None:
             ["driver", "wood_or_hybrid", "iron", "wedge"],
             format_func=lambda value: value.replace("_", " / ").title(),
         )
-    uploaded = st.file_uploader(
-        "Upload a golf swing video",
-        type=["mp4", "mov", "m4v", "avi"],
-        accept_multiple_files=False,
-    )
     if uploaded is None:
-        st.info("Upload a video to run local pose analysis.")
+        st.info("Upload a video to start a local swing review.")
         return
 
-    run_button = st.button("Analyse swing", type="primary")
+    run_button = st.button("Review swing", type="primary")
     if not run_button:
         active_run = st.session_state.get("active_run_dir")
         if active_run:
@@ -138,9 +144,30 @@ def _render_result(result, title: str, success: bool = False) -> None:
         st.success(title)
     else:
         st.caption(title)
-    result = _render_phase_editor(result)
-    _render_llm_assessment(result)
-    _render_measured_pose_data(result)
+
+    issues = result.metrics.quality.get("phase_quality_issues", [])
+    outdated = _uses_superseded_phase_detection(result)
+    if issues or outdated:
+        st.warning(
+            "Swing markers need review before coaching can be relied on. "
+            "Open Advanced to re-run detection or confirm the key frames."
+        )
+
+    assessment_tab, replay_tab, evidence_tab, advanced_tab = st.tabs(
+        ["Assessment", "Replay", "Evidence", "Advanced"]
+    )
+    with advanced_tab:
+        result = _render_phase_editor(result, expanded=bool(issues) or outdated)
+        _render_advanced_details(result)
+    with assessment_tab:
+        _render_llm_assessment(result)
+    with replay_tab:
+        _render_replay(result)
+    with evidence_tab:
+        _render_evidence(result)
+
+
+def _render_replay(result) -> None:
     st.subheader("Annotated Replay")
     try:
         with st.spinner("Preparing replay for browser playback..."):
@@ -148,7 +175,7 @@ def _render_result(result, title: str, success: bool = False) -> None:
     except RuntimeError as exc:
         st.warning(f"Unable to prepare in-app playback: {exc}")
         playback_video = result.artifacts.annotated_video
-    st.video(str(playback_video), format="video/mp4")
+    st.video(str(playback_video), format="video/mp4", width=_replay_video_width(result))
     _download_button(
         "Download annotated video",
         result.artifacts.annotated_video,
@@ -156,6 +183,47 @@ def _render_result(result, title: str, success: bool = False) -> None:
         key="download_annotated_video",
     )
 
+
+def _render_evidence(result) -> None:
+    st.subheader("Evidence Frames")
+    if result.llm_assessment is not None and llm_assessment_is_current(result):
+        assessment = result.llm_assessment
+        used_frame_ids = []
+        for priority in assessment.content.priorities:
+            used_frame_ids.extend(priority.supporting_frame_ids)
+        for observation in assessment.content.observations:
+            used_frame_ids.extend(observation.supporting_frame_ids)
+        if used_frame_ids:
+            st.markdown("**Frames referenced by the AI assessment**")
+            _render_llm_frame_evidence(result, _unique_ordered(used_frame_ids))
+
+    st.markdown("**Key swing positions**")
+    keyframes = sorted(result.artifacts.keyframes_dir.glob("*.jpg"))
+    if keyframes:
+        columns = st.columns(min(4, len(keyframes)))
+        for index, image_path in enumerate(keyframes):
+            with columns[index % len(columns)]:
+                st.image(
+                    str(image_path),
+                    caption=image_path.stem.replace("_", " ").title(),
+                    width=KEYFRAME_IMAGE_WIDTH,
+                )
+    else:
+        st.write("No keyframes were exported.")
+
+    quality = result.metrics.quality
+    with st.expander("Evidence quality", expanded=False):
+        st.write(
+            {
+                "frames_with_pose": quality.get("frames_with_pose", 0),
+                "frames_total": quality.get("frames_total", 0),
+                "pose_detection_rate": quality.get("pose_detection_rate", 0.0),
+                "phase_markers_confirmed": quality.get("phase_markers_confirmed", False),
+            }
+        )
+
+
+def _render_advanced_details(result) -> None:
     left, right = st.columns(2)
     with left:
         st.subheader("Swing Phases")
@@ -200,36 +268,28 @@ def _render_result(result, title: str, success: bool = False) -> None:
             key="download_metrics_json",
         )
 
-    st.subheader("Key Frames")
-    keyframes = sorted(result.artifacts.keyframes_dir.glob("*.jpg"))
-    if keyframes:
-        columns = st.columns(min(4, len(keyframes)))
-        for index, image_path in enumerate(keyframes):
-            with columns[index % len(columns)]:
-                st.image(str(image_path), caption=image_path.stem.replace("_", " ").title())
-    else:
-        st.write("No keyframes were exported.")
+    _render_measured_pose_data(result)
 
-    st.subheader("Landmarks")
-    st.write(
-        {
-            "frames": len(result.landmarks),
-            "frames_with_pose": result.metrics.quality.get("frames_with_pose", 0),
-            "pose_detection_rate": result.metrics.quality.get("pose_detection_rate", 0.0),
-        }
-    )
-    _download_button(
-        "Download landmarks JSON",
-        result.artifacts.landmarks_json,
-        "application/json",
-        key="download_landmarks_json",
-    )
+    with st.expander("Landmarks", expanded=False):
+        st.write(
+            {
+                "frames": len(result.landmarks),
+                "frames_with_pose": result.metrics.quality.get("frames_with_pose", 0),
+                "pose_detection_rate": result.metrics.quality.get("pose_detection_rate", 0.0),
+            }
+        )
+        _download_button(
+            "Download landmarks JSON",
+            result.artifacts.landmarks_json,
+            "application/json",
+            key="download_landmarks_json",
+        )
 
 
-def _render_phase_editor(result):
+def _render_phase_editor(result, expanded: bool = False):
     issues = result.metrics.quality.get("phase_quality_issues", [])
     outdated = _uses_superseded_phase_detection(result)
-    with st.expander("Review phase timing", expanded=bool(issues) or outdated):
+    with st.expander("Review swing markers", expanded=expanded):
         if outdated:
             st.warning(
                 "This saved analysis used earlier timing or evidence calculations that "
@@ -372,11 +432,6 @@ def _render_llm_assessment(result) -> None:
         st.info(issue)
         return
 
-    st.caption(
-        "Generation sends selected labelled stills and measured pose data to OpenAI. "
-        "API data is not used for training by default; standard abuse-monitoring "
-        "retention may apply. No deterministic reference ranges are sent to the model."
-    )
     if not os.environ.get("OPENAI_API_KEY"):
         st.info("Set OPENAI_API_KEY in the local .env file to enable AI swing assessment.")
         return
@@ -402,39 +457,42 @@ def _render_llm_assessment(result) -> None:
                 st.success("AI swing assessment generated and saved with this analysis.")
 
     if not assessment_is_current or result.llm_assessment is None:
+        st.caption(
+            "The assessment uses labelled stills, local pose measurements, and local "
+            "quality checks. It does not infer clubface, strike quality, or ball flight."
+        )
         return
     assessment = result.llm_assessment
     st.write(assessment.content.overview)
     if assessment.content.priorities:
         st.markdown("**Practice Priorities**")
-        for priority in assessment.content.priorities:
-            with st.expander(
-                f"{priority.title} - AI-generated - confidence {priority.confidence:.2f}",
-                expanded=True,
-            ):
+        for index, priority in enumerate(assessment.content.priorities, start=1):
+            with st.container(border=True):
+                heading, confidence = st.columns([4, 1])
+                with heading:
+                    st.markdown(f"**{index}. {priority.title}**")
+                with confidence:
+                    st.caption(_confidence_label(priority.confidence))
                 st.write(priority.rationale)
-                st.write(f"Practice cue: {priority.practice_cue}")
+                st.info(f"Practice cue: {priority.practice_cue}")
                 _render_llm_frame_evidence(result, priority.supporting_frame_ids)
                 if priority.related_metric_keys:
-                    st.caption(
-                        "Related metrics: " + ", ".join(priority.related_metric_keys)
-                    )
+                    with st.expander("Supporting measurements", expanded=False):
+                        _render_related_metrics(result, priority.related_metric_keys)
     if assessment.content.strengths:
         st.markdown("**Strengths**")
         for strength in assessment.content.strengths:
-            st.write(strength)
+            st.success(strength)
     if assessment.content.observations:
         st.markdown("**Visible Observations**")
         for observation in assessment.content.observations:
             with st.expander(
-                f"{observation.title} - confidence {observation.confidence:.2f}"
+                f"{observation.title} - {_confidence_label(observation.confidence)}"
             ):
                 st.write(observation.observation)
                 _render_llm_frame_evidence(result, observation.supporting_frame_ids)
                 if observation.related_metric_keys:
-                    st.caption(
-                        "Related metrics: " + ", ".join(observation.related_metric_keys)
-                    )
+                    _render_related_metrics(result, observation.related_metric_keys)
     if assessment.content.limitations:
         st.markdown("**Limitations**")
         for limitation in assessment.content.limitations:
@@ -449,6 +507,26 @@ def _render_llm_assessment(result) -> None:
         )
 
 
+def _render_related_metrics(result, metric_keys: list[str]) -> None:
+    rows = []
+    for key in metric_keys:
+        metric = result.metrics.metrics.get(key)
+        if metric is None:
+            continue
+        rows.append(
+            {
+                "Metric": metric.name,
+                "Value": _format_metric_value(metric.value),
+                "Unit": metric.unit or "",
+                "Frame": metric.frame_index,
+            }
+        )
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+    else:
+        st.caption("No related measurements are available for this run.")
+
+
 def _render_llm_frame_evidence(result, frame_ids: list[str]) -> None:
     assessment = result.llm_assessment
     if assessment is None or not frame_ids or result.artifacts.llm_frames_dir is None:
@@ -457,7 +535,7 @@ def _render_llm_frame_evidence(result, frame_ids: list[str]) -> None:
     frames = [by_id[frame_id] for frame_id in frame_ids if frame_id in by_id]
     if not frames:
         return
-    columns = st.columns(min(3, len(frames)))
+    columns = st.columns(min(4, len(frames)))
     for index, frame in enumerate(frames):
         image_path = result.artifacts.llm_frames_dir / frame.image_file
         if image_path.exists():
@@ -465,7 +543,35 @@ def _render_llm_frame_evidence(result, frame_ids: list[str]) -> None:
                 st.image(
                     str(image_path),
                     caption=f"{frame.frame_id}: {', '.join(frame.phase_relations)}",
+                    width=ASSESSMENT_EVIDENCE_IMAGE_WIDTH,
                 )
+
+
+def _confidence_label(confidence: float) -> str:
+    if confidence >= 0.75:
+        return "High confidence"
+    if confidence >= 0.5:
+        return "Medium confidence"
+    return "Low confidence"
+
+
+def _replay_video_width(result) -> int:
+    metadata = result.metadata
+    if metadata.width <= 0 or metadata.height <= 0:
+        return MAX_REPLAY_VIDEO_WIDTH
+    aspect_ratio = metadata.width / metadata.height
+    height_limited_width = round(MAX_REPLAY_VIDEO_HEIGHT * aspect_ratio)
+    return max(240, min(MAX_REPLAY_VIDEO_WIDTH, height_limited_width))
+
+
+def _unique_ordered(values: list[str]) -> list[str]:
+    seen = set()
+    unique = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            unique.append(value)
+    return unique
 
 
 def _uses_superseded_phase_detection(result) -> bool:
