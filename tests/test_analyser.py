@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 import cv2
 import numpy as np
 import pytest
 
 from analysis import AnalysisContext, SwingAnalyser, list_analysis_runs, load_analysis_result
+from analysis.models import MetricSet, SwingPhase
 from analysis.visualise import browser_playback_video
 
 
@@ -27,7 +30,7 @@ def test_analyser_creates_expected_outputs(tmp_path):
     assert result.artifacts.keyframes_dir.exists()
     assert _video_fourcc(result.artifacts.annotated_video) in {"avc1", "h264", "H264"}
     assert len(result.landmarks) == 5
-    assert len(result.phases) == 7
+    assert len(result.phases) == 9
 
     runs = list_analysis_runs(tmp_path)
     assert runs == [tmp_path / "run"]
@@ -60,11 +63,51 @@ def test_contextual_analysis_writes_assessment_and_reloads_it(tmp_path):
         for finding in loaded.assessment.findings
     )
 
-    corrected = SwingAnalyser().confirm_phase_markers(result, 0, 1, 2, 4)
+    corrected = SwingAnalyser().confirm_phase_markers(result, 0, 1, 2, 3, 4, 5, 6, 7, 8)
     reloaded = load_analysis_result(tmp_path / "assessed")
 
     assert corrected.metrics.quality["phase_markers_confirmed"] is True
     assert reloaded.phases[0].detection_method == "user_confirmed_marker"
+
+
+def test_reassess_legacy_run_overwrites_phase_dependent_artifacts_in_place(tmp_path):
+    run_dir = tmp_path / "legacy"
+    run_dir.mkdir()
+    _write_blank_video(run_dir / "original.mp4")
+    _write_blank_video(run_dir / "annotated.mp4")
+    (run_dir / "keyframes").mkdir()
+    (run_dir / "keyframes" / "top_of_backswing.jpg").write_bytes(b"old")
+    metadata = {
+        "source_path": "input.mp4",
+        "fps": 5,
+        "frame_count": 5,
+        "width": 64,
+        "height": 64,
+        "duration_seconds": 1.0,
+    }
+    (run_dir / "landmarks.json").write_text(
+        json.dumps({"metadata": metadata, "frames": []}),
+        encoding="utf-8",
+    )
+    (run_dir / "metrics.json").write_text(MetricSet().model_dump_json(), encoding="utf-8")
+    legacy_phases = [
+        SwingPhase(name="Address", frame_index=0, timestamp_seconds=0, confidence=0.8, detection_method="test"),
+        SwingPhase(name="Top of backswing", frame_index=1, timestamp_seconds=0.2, confidence=0.8, detection_method="test"),
+        SwingPhase(name="Impact approximation", frame_index=3, timestamp_seconds=0.6, confidence=0.8, detection_method="test"),
+        SwingPhase(name="Finish", frame_index=4, timestamp_seconds=0.8, confidence=0.8, detection_method="test"),
+    ]
+    (run_dir / "phases.json").write_text(
+        json.dumps({"phases": [phase.model_dump(mode="json") for phase in legacy_phases]}),
+        encoding="utf-8",
+    )
+
+    result = load_analysis_result(run_dir)
+    updated = SwingAnalyser().reassess_with_current_phase_model(result)
+    reloaded = load_analysis_result(run_dir)
+
+    assert updated.artifacts.output_dir == run_dir
+    assert len(reloaded.phases) == 9
+    assert not (run_dir / "keyframes" / "top_of_backswing.jpg").exists()
 
 
 def test_list_analysis_runs_excludes_incomplete_directories(tmp_path):

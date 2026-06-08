@@ -8,12 +8,42 @@ from analysis.models import LandmarkFrame, LandmarkPoint, SwingPhase
 PHASE_NAMES = [
     "Address",
     "Takeaway",
-    "Top of backswing",
-    "Downswing",
-    "Impact approximation",
-    "Follow-through",
+    "Lead arm parallel backswing (P3)",
+    "Top (P4)",
+    "Lead arm parallel downswing (P5)",
+    "Shaft parallel downswing (P6)",
+    "Impact approximation (P7)",
+    "Shaft parallel follow-through (P8)",
     "Finish",
 ]
+
+ADDRESS_PHASE = "Address"
+TAKEAWAY_PHASE = "Takeaway"
+P3_PHASE = "Lead arm parallel backswing (P3)"
+TOP_PHASE = "Top (P4)"
+P5_PHASE = "Lead arm parallel downswing (P5)"
+P6_PHASE = "Shaft parallel downswing (P6)"
+IMPACT_PHASE = "Impact approximation (P7)"
+P8_PHASE = "Shaft parallel follow-through (P8)"
+FINISH_PHASE = "Finish"
+
+LEGACY_PHASE_ALIASES = {
+    "Top of backswing": TOP_PHASE,
+    "Downswing": P6_PHASE,
+    "Impact approximation": IMPACT_PHASE,
+    "Follow-through": P8_PHASE,
+}
+
+
+def canonical_phase_name(name: str) -> str:
+    return LEGACY_PHASE_ALIASES.get(name, name)
+
+
+def phase_by_name(phases: list[SwingPhase]) -> dict[str, SwingPhase]:
+    by_name: dict[str, SwingPhase] = {}
+    for phase in phases:
+        by_name.setdefault(canonical_phase_name(phase.name), phase)
+    return by_name
 
 
 def detect_swing_phases(
@@ -34,26 +64,31 @@ def detect_swing_phases(
     if impact is None:
         return _fallback_phases(landmark_frames, fps, "no_ordered_impact_return")
     finish_idx = _first_finish_position(active, impact[0], address, top)
+    p6_idx = _first_downswing_delivery_index(active, top, impact, address)
 
     indices = [
         address_idx,
-        _nearest_detected_index(active, _between(address_idx, top[0], 0.35)),
+        _nearest_detected_index(active, _between(address_idx, top[0], 0.25)),
+        _nearest_detected_index(active, _between(address_idx, top[0], 0.65)),
         top[0],
-        _nearest_detected_index(active, _between(top[0], impact[0], 0.45)),
+        _nearest_detected_index(active, _between(top[0], impact[0], 0.32)),
+        p6_idx,
         impact[0],
         _nearest_detected_index(active, _between(impact[0], finish_idx, 0.45)),
         finish_idx,
     ]
     methods = [
         "detected_stable_address_before_motion",
-        "ordered_address_to_top",
+        "pose_proxy_ordered_address_to_top",
+        "pose_proxy_ordered_address_to_top",
         top_method,
-        "ordered_top_to_impact",
+        "pose_proxy_ordered_top_to_impact",
+        "pose_proxy_hand_return_to_delivery",
         "first_post_top_strike_region_transition",
-        "ordered_impact_to_finish",
+        "pose_proxy_ordered_impact_to_finish",
         "first_post_impact_high_hands_position",
     ]
-    confidences = [0.72, 0.68, top_confidence, 0.7, 0.72, 0.66, 0.68]
+    confidences = [0.72, 0.62, 0.64, top_confidence, 0.64, 0.66, 0.72, 0.64, 0.68]
     return [
         SwingPhase(
             name=name,
@@ -70,22 +105,34 @@ def detect_swing_phases(
 
 def build_confirmed_phases(
     address_index: int,
-    top_index: int,
-    impact_index: int,
-    finish_index: int,
+    *marker_indices: int,
     fps: float,
 ) -> list[SwingPhase]:
-    if not address_index < top_index < impact_index < finish_index:
-        raise ValueError("Phase markers must be ordered: Address < Top < Impact < Finish.")
-    indices = [
-        address_index,
-        _between(address_index, top_index, 0.35),
-        top_index,
-        _between(top_index, impact_index, 0.45),
-        impact_index,
-        _between(impact_index, finish_index, 0.45),
-        finish_index,
-    ]
+    if len(marker_indices) == 3:
+        top_index, impact_index, finish_index = marker_indices
+        indices = [
+            address_index,
+            _between(address_index, top_index, 0.25),
+            _between(address_index, top_index, 0.65),
+            top_index,
+            _between(top_index, impact_index, 0.32),
+            _between(top_index, impact_index, 0.62),
+            impact_index,
+            _between(impact_index, finish_index, 0.45),
+            finish_index,
+        ]
+        confirmed_names = {ADDRESS_PHASE, TOP_PHASE, IMPACT_PHASE, FINISH_PHASE}
+    elif len(marker_indices) == len(PHASE_NAMES) - 1:
+        indices = [address_index, *marker_indices]
+        confirmed_names = set(PHASE_NAMES)
+    else:
+        raise ValueError("Expected either 4 legacy markers or all 9 phase markers.")
+    if not _strictly_ordered(indices):
+        raise ValueError(
+            "Phase markers must be ordered: "
+            + " < ".join(_short_phase_name(name) for name in PHASE_NAMES)
+            + "."
+        )
     return [
         SwingPhase(
             name=name,
@@ -94,8 +141,7 @@ def build_confirmed_phases(
             confidence=1.0,
             detection_method=(
                 "user_confirmed_marker"
-                if name
-                in {"Address", "Top of backswing", "Impact approximation", "Finish"}
+                if name in confirmed_names
                 else "interpolated_from_user_confirmed_markers"
             ),
         )
@@ -104,23 +150,20 @@ def build_confirmed_phases(
 
 
 def phase_quality_issues(phases: list[SwingPhase], fps: float) -> list[str]:
-    phase_by_name = {phase.name: phase for phase in phases}
-    required = [
-        phase_by_name.get("Address"),
-        phase_by_name.get("Top of backswing"),
-        phase_by_name.get("Impact approximation"),
-        phase_by_name.get("Finish"),
-    ]
+    phases_by_name = phase_by_name(phases)
+    required = [phases_by_name.get(name) for name in PHASE_NAMES]
     if any(phase is None for phase in required):
         return ["Required swing phase markers are missing."]
-    address, top, impact, finish = required
-    if not address.frame_index < top.frame_index < impact.frame_index < finish.frame_index:
+    if not _strictly_ordered([phase.frame_index for phase in required if phase is not None]):
         return ["Swing phases are not in chronological order."]
     if any(phase.detection_method.startswith("no_") for phase in phases):
         return ["Automatic detection could not establish an ordered swing sequence."]
     manually_confirmed = any(
         phase.detection_method == "user_confirmed_marker" for phase in phases
     )
+    address = phases_by_name[ADDRESS_PHASE]
+    top = phases_by_name[TOP_PHASE]
+    impact = phases_by_name[IMPACT_PHASE]
     backswing = (top.frame_index - address.frame_index) / max(fps, 1e-9)
     downswing = (impact.frame_index - top.frame_index) / max(fps, 1e-9)
     if not manually_confirmed and downswing > backswing:
@@ -201,12 +244,15 @@ def _active_address_index(points: list[tuple[int, float, float]]) -> int:
         hypot(current[1] - previous[1], current[2] - previous[2])
         for previous, current in zip(points, points[1:])
     ]
-    idle = sorted(velocities[: min(10, len(velocities))])
+    idle = sorted(velocities[: min(15, len(velocities))])
     baseline = idle[len(idle) // 2] if idle else 0.0
-    threshold = max(0.006, baseline * 2.5)
-    for index in range(1, len(points) - 2):
-        if sum(velocity > threshold for velocity in velocities[index - 1 : index + 2]) >= 2:
-            return points[max(0, index - 1)][0]
+    threshold = max(0.003, baseline * 4)
+    for index in range(1, len(velocities) - 4):
+        if (
+            sum(velocity > threshold for velocity in velocities[index : index + 4]) >= 3
+            and sum(velocities[index : index + 4]) > threshold * 5
+        ):
+            return points[min(len(points) - 1, index + 1)][0]
     return points[0][0]
 
 
@@ -297,15 +343,48 @@ def _first_finish_position(
     if not after_impact:
         return impact_index + 1
     high_threshold = address[2] - max(address[2] - top[2], 0.04) * 0.55
+    min_completion_index = impact_index + max(1, impact_index - top[0])
     for index in range(1, len(after_impact) - 1):
         candidate = after_impact[index]
         if (
+            candidate[0] >= min_completion_index
+            and
             candidate[2] <= high_threshold
             and candidate[2] <= after_impact[index - 1][2]
             and candidate[2] <= after_impact[index + 1][2] + 0.006
         ):
             return candidate[0]
-    return after_impact[min(len(after_impact) - 1, max(1, len(after_impact) // 3))][0]
+    late_high = [
+        point for point in after_impact if point[0] >= min_completion_index and point[2] <= high_threshold
+    ]
+    if late_high:
+        return late_high[-1][0]
+    return after_impact[-1][0]
+
+
+def _first_downswing_delivery_index(
+    points: list[tuple[int, float, float]],
+    top: tuple[int, float, float],
+    impact: tuple[int, float, float],
+    address: tuple[int, float, float],
+) -> int:
+    """Approximate P6 from body pose by hand return depth, not elapsed time.
+
+    MediaPipe does not track the club shaft. The best local proxy is the first
+    post-P5 downswing frame where the hands have returned materially toward the
+    address hand height, immediately before the strike-region transition.
+    """
+    excursion = max(address[2] - top[2], 0.04)
+    target_y = top[2] + excursion * 0.45
+    p5_floor = top[0] + max(1, round((impact[0] - top[0]) * 0.32))
+    candidates = [
+        point
+        for point in points
+        if p5_floor < point[0] < impact[0] and point[2] >= target_y
+    ]
+    if candidates:
+        return candidates[0][0]
+    return _nearest_detected_index(points, _between(top[0], impact[0], 0.82))
 
 
 def _landmark(frame: LandmarkFrame, name: str) -> LandmarkPoint | None:
@@ -314,6 +393,24 @@ def _landmark(frame: LandmarkFrame, name: str) -> LandmarkPoint | None:
 
 def _between(start: int, end: int, fraction: float) -> int:
     return int(round(start + (end - start) * fraction))
+
+
+def _strictly_ordered(indices: list[int]) -> bool:
+    return all(first < second for first, second in zip(indices, indices[1:]))
+
+
+def _short_phase_name(name: str) -> str:
+    if name == IMPACT_PHASE:
+        return "Impact"
+    if name.startswith("Lead arm parallel backswing"):
+        return "P3"
+    if name.startswith("Lead arm parallel downswing"):
+        return "P5"
+    if name.startswith("Shaft parallel downswing"):
+        return "P6"
+    if name.startswith("Shaft parallel follow-through"):
+        return "P8"
+    return name.replace(" (P4)", "")
 
 
 def _nearest_detected_index(points: list[tuple[int, float, float]], target: int) -> int:
@@ -333,7 +430,7 @@ def _fallback_phases(
         if len(landmark_frames) <= 1
         else [
             int(round(max_index * fraction))
-            for fraction in (0.0, 0.18, 0.35, 0.5, 0.62, 0.78, 1.0)
+            for fraction in (0.0, 0.12, 0.26, 0.4, 0.5, 0.6, 0.72, 0.84, 1.0)
         ]
     )
     return [

@@ -22,6 +22,19 @@ from analysis.llm_assessment import (
     llm_assessment_is_current,
 )
 from analysis.models import AnalysisContext
+from analysis.phases import (
+    ADDRESS_PHASE,
+    FINISH_PHASE,
+    IMPACT_PHASE,
+    P3_PHASE,
+    P5_PHASE,
+    P6_PHASE,
+    P8_PHASE,
+    PHASE_NAMES,
+    TAKEAWAY_PHASE,
+    TOP_PHASE,
+    phase_by_name,
+)
 from analysis.storage import list_analysis_runs, load_analysis_result
 from analysis.visualise import browser_playback_video
 
@@ -316,51 +329,38 @@ def _render_phase_editor(result, expanded: bool = False):
                 st.warning("Automatic re-detection remains uncertain. Confirm the key frames below.")
             else:
                 st.success("Automatic phase detection rerun and results regenerated.")
-        by_name = {phase.name: phase.frame_index for phase in result.phases}
+        if _uses_superseded_phase_detection(result) and st.button(
+            "Reassess with 9-phase model",
+            key=f"reassess_{result.artifacts.output_dir.name}",
+        ):
+            try:
+                result = SwingAnalyser().reassess_with_current_phase_model(result)
+            except Exception as exc:  # pragma: no cover - Streamlit error path
+                st.error(f"Unable to reassess this run: {exc}")
+            else:
+                st.success("Run reassessed with the 9-phase model.")
+        defaults = _phase_editor_defaults(result)
         maximum = max(0, result.metadata.frame_count - 1)
         with st.form(f"phase_markers_{result.artifacts.output_dir.name}"):
-            columns = st.columns(4)
-            with columns[0]:
-                address = st.number_input(
-                    "Address frame",
-                    min_value=0,
-                    max_value=maximum,
-                    value=min(by_name.get("Address", 0), maximum),
-                    step=1,
-                )
-            with columns[1]:
-                top = st.number_input(
-                    "Top frame",
-                    min_value=0,
-                    max_value=maximum,
-                    value=min(by_name.get("Top of backswing", 0), maximum),
-                    step=1,
-                )
-            with columns[2]:
-                impact = st.number_input(
-                    "Impact frame",
-                    min_value=0,
-                    max_value=maximum,
-                    value=min(by_name.get("Impact approximation", 0), maximum),
-                    step=1,
-                )
-            with columns[3]:
-                finish = st.number_input(
-                    "Finish frame",
-                    min_value=0,
-                    max_value=maximum,
-                    value=min(by_name.get("Finish", maximum), maximum),
-                    step=1,
-                )
+            phase_values = []
+            columns = st.columns(3)
+            for index, phase_name in enumerate(PHASE_NAMES):
+                with columns[index % len(columns)]:
+                    phase_values.append(
+                        st.number_input(
+                            f"{phase_name} frame",
+                            min_value=0,
+                            max_value=maximum,
+                            value=min(defaults.get(phase_name, 0), maximum),
+                            step=1,
+                        )
+                    )
             submitted = st.form_submit_button("Confirm phase markers")
         if submitted:
             try:
                 result = SwingAnalyser().confirm_phase_markers(
                     result,
-                    int(address),
-                    int(top),
-                    int(impact),
-                    int(finish),
+                    *(int(value) for value in phase_values),
                 )
             except ValueError as exc:
                 st.error(str(exc))
@@ -475,6 +475,7 @@ def _render_llm_assessment(result) -> None:
                     st.caption(_confidence_label(priority.confidence))
                 st.write(priority.rationale)
                 st.info(f"Practice cue: {priority.practice_cue}")
+                _render_priority_drilldown(result, priority)
                 _render_llm_frame_evidence(result, priority.supporting_frame_ids)
                 if priority.related_metric_keys:
                     with st.expander("Supporting measurements", expanded=False):
@@ -505,6 +506,58 @@ def _render_llm_assessment(result) -> None:
             "application/json",
             key="download_llm_assessment_json",
         )
+
+
+def _render_priority_drilldown(result, priority) -> None:
+    with st.expander("Explore this priority", expanded=False):
+        st.markdown("**What this means**")
+        st.write(priority.explanation or priority.rationale)
+
+        st.markdown("**Drills**")
+        for drill in _priority_drills(priority):
+            st.markdown(f"- {drill}")
+
+        st.markdown("**Practice plan**")
+        for step in _priority_practice_plan(result, priority):
+            st.markdown(f"- {step}")
+
+        st.caption(
+            "Use the evidence frames and measurements below to compare the same "
+            "positions after another recorded swing."
+        )
+
+
+def _priority_drills(priority) -> list[str]:
+    if priority.drills:
+        return priority.drills
+    return [
+        f"Make slow-motion rehearsals using this cue: {priority.practice_cue}",
+        "Pause at the referenced phase positions and check the feel against the replay.",
+        "Hit a short block of easy swings while keeping attention on this one priority.",
+    ]
+
+
+def _priority_practice_plan(result, priority) -> list[str]:
+    if priority.practice_plan:
+        return priority.practice_plan
+    camera_view = _practice_camera_view(result)
+    progress_check = (
+        "Compare the supporting measurements after a new analysis run."
+        if priority.related_metric_keys
+        else "Compare the same evidence frames after a new analysis run."
+    )
+    return [
+        "Start without a ball and make five slow rehearsals focused only on this cue.",
+        f"Record two or three rehearsals from the {camera_view} so the frames are comparable.",
+        "Hit five easy balls at reduced speed before adding normal tempo.",
+        progress_check,
+    ]
+
+
+def _practice_camera_view(result) -> str:
+    if result.assessment is None:
+        return "same camera view"
+    return f"{result.assessment.context.camera_view.replace('_', ' ')} view"
 
 
 def _render_related_metrics(result, metric_keys: list[str]) -> None:
@@ -580,10 +633,57 @@ def _uses_superseded_phase_detection(result) -> bool:
         "closest_wrist_return_to_address_after_top",
         "detected_active_swing_onset",
     }
-    return result.assessment is not None and (
+    phases_by_name = phase_by_name(result.phases)
+    return (
         not result.metrics.quality.get("phase_scoped_metrics", False)
+        or any(name not in phases_by_name for name in PHASE_NAMES)
         or any(phase.detection_method in superseded_methods for phase in result.phases)
     )
+
+
+def _phase_editor_defaults(result) -> dict[str, int]:
+    by_name = phase_by_name(result.phases)
+    maximum = max(0, result.metadata.frame_count - 1)
+    if all(name in by_name for name in PHASE_NAMES):
+        return {
+            name: min(by_name[name].frame_index, maximum)
+            for name in PHASE_NAMES
+        }
+    fallback_address = result.phases[0].frame_index if result.phases else 0
+    address = min(by_name.get(ADDRESS_PHASE).frame_index if by_name.get(ADDRESS_PHASE) else fallback_address, maximum)
+    top = min(
+        by_name.get(TOP_PHASE).frame_index
+        if by_name.get(TOP_PHASE)
+        else max(address + 1, round(maximum * 0.4)),
+        maximum,
+    )
+    impact = min(
+        by_name.get(IMPACT_PHASE).frame_index
+        if by_name.get(IMPACT_PHASE)
+        else max(top + 1, round(maximum * 0.72)),
+        maximum,
+    )
+    finish = min(
+        by_name.get(FINISH_PHASE).frame_index
+        if by_name.get(FINISH_PHASE)
+        else maximum,
+        maximum,
+    )
+    return {
+        ADDRESS_PHASE: address,
+        TAKEAWAY_PHASE: _between(address, top, 0.25),
+        P3_PHASE: _between(address, top, 0.65),
+        TOP_PHASE: top,
+        P5_PHASE: _between(top, impact, 0.32),
+        P6_PHASE: _between(top, impact, 0.62),
+        IMPACT_PHASE: impact,
+        P8_PHASE: _between(impact, finish, 0.45),
+        FINISH_PHASE: finish,
+    }
+
+
+def _between(start: int, end: int, fraction: float) -> int:
+    return int(round(start + (end - start) * fraction))
 
 
 def _run_label(run_dir: Path) -> str:

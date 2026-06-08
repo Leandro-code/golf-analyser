@@ -11,6 +11,7 @@ from analysis.models import (
     SwingPhase,
     TechniqueReference,
 )
+from analysis.phases import phase_by_name
 
 
 RUBRIC_PATH = Path(__file__).with_name("rubric.v1.json")
@@ -24,7 +25,7 @@ def assess_swing(
     context: AnalysisContext,
 ) -> SwingAssessment:
     version, references = _load_rubric()
-    phase_by_name = {phase.name: phase for phase in phases}
+    phases_by_name = phase_by_name(phases)
     quality_limitations: list[str] = []
     pose_rate = float(metrics.quality.get("pose_detection_rate", 0.0))
     if pose_rate < MIN_POSE_DETECTION_RATE:
@@ -48,7 +49,7 @@ def assess_swing(
         _evaluate_reference(
             reference,
             metrics,
-            phase_by_name,
+            phases_by_name,
             pose_rate,
             quality_limitations,
         )

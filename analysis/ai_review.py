@@ -11,16 +11,25 @@ from typing import Any
 from openai import OpenAI
 
 from analysis.models import AIReviewContent, AIVisualReview, AnalysisResult, SwingPhase
+from analysis.phases import (
+    ADDRESS_PHASE,
+    FINISH_PHASE,
+    IMPACT_PHASE,
+    P6_PHASE,
+    TOP_PHASE,
+    canonical_phase_name,
+    phase_by_name,
+)
 
 
 SCHEMA_VERSION = "1.0.0"
 PROMPT_VERSION = "1.0.0"
 DEFAULT_MODEL = "gpt-5.5"
 ANCHOR_PHASES = [
-    "Address",
-    "Top of backswing",
-    "Impact approximation",
-    "Finish",
+    ADDRESS_PHASE,
+    TOP_PHASE,
+    IMPACT_PHASE,
+    FINISH_PHASE,
 ]
 SUPERSEDED_PHASE_METHODS = {
     "minimum_wrist_y_coordinate",
@@ -140,7 +149,7 @@ def ai_review_eligibility_issue(result: AnalysisResult) -> str | None:
             "AI visual review is withheld until pose evidence and phase timing "
             "are reliable."
         )
-    phase_names = {phase.name for phase in result.phases}
+    phase_names = set(phase_by_name(result.phases))
     missing_phases = [
         phase_name
         for phase_name in _selected_phase_names(result)
@@ -168,10 +177,11 @@ def ai_review_is_current(result: AnalysisResult) -> bool:
 
 def ai_review_fingerprint(result: AnalysisResult) -> str:
     selected_names = _selected_phase_names(result)
+    phases = phase_by_name(result.phases)
     selected_phases = [
-        phase.model_dump(mode="json")
-        for phase in result.phases
-        if phase.name in selected_names
+        phases[name].model_dump(mode="json")
+        for name in selected_names
+        if name in phases
     ]
     applicable_metrics = []
     if result.assessment is not None:
@@ -201,17 +211,17 @@ def ai_review_fingerprint(result: AnalysisResult) -> str:
 
 
 def _selected_phases(result: AnalysisResult) -> list[SwingPhase]:
-    by_name = {phase.name: phase for phase in result.phases}
+    by_name = phase_by_name(result.phases)
     return [by_name[name] for name in _selected_phase_names(result) if name in by_name]
 
 
 def _selected_phase_names(result: AnalysisResult) -> list[str]:
     names = list(ANCHOR_PHASES)
     if result.assessment and any(
-        finding.reference.phase_name == "Downswing"
+        canonical_phase_name(finding.reference.phase_name or "") == P6_PHASE
         for finding in result.assessment.findings
     ):
-        names.insert(3, "Downswing")
+        names.insert(3, P6_PHASE)
     return names
 
 
@@ -268,7 +278,13 @@ def _keyframe_path(result: AnalysisResult, phase_name: str) -> Path:
 
 
 def _safe_phase_filename(name: str) -> str:
-    return name.lower().replace(" ", "_").replace("-", "_")
+    return (
+        name.lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )
 
 
 def _data_url(path: Path) -> str:

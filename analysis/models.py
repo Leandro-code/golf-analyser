@@ -151,6 +151,9 @@ class LLMPriority(BaseModel):
     title: str
     rationale: str
     practice_cue: str
+    explanation: str | None = None
+    drills: list[str] = Field(default_factory=list, max_length=5)
+    practice_plan: list[str] = Field(default_factory=list, max_length=5)
     supporting_frame_ids: list[str] = Field(default_factory=list)
     related_metric_keys: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)

@@ -12,7 +12,16 @@ from analysis.models import (
     MetricValue,
     SwingPhase,
 )
-from analysis.phases import phase_quality_issues
+from analysis.phases import (
+    ADDRESS_PHASE,
+    FINISH_PHASE,
+    IMPACT_PHASE,
+    P6_PHASE,
+    P8_PHASE,
+    TOP_PHASE,
+    phase_by_name,
+    phase_quality_issues,
+)
 
 
 def calculate_metrics(
@@ -58,10 +67,10 @@ def calculate_metrics(
 
 
 def _tempo_ratio(phases: list[SwingPhase]) -> MetricValue:
-    by_name = {phase.name: phase for phase in phases}
-    address = by_name.get("Address")
-    top = by_name.get("Top of backswing")
-    impact = by_name.get("Impact approximation")
+    by_name = phase_by_name(phases)
+    address = by_name.get(ADDRESS_PHASE)
+    top = by_name.get(TOP_PHASE)
+    impact = by_name.get(IMPACT_PHASE)
     value = None
     if address and top and impact:
         backswing = top.timestamp_seconds - address.timestamp_seconds
@@ -83,7 +92,7 @@ def _head_movement(
     address_frame: LandmarkFrame | None,
     body_scale: float | None,
 ) -> MetricValue:
-    impact_frame = _phase_frame(frames, phases, "Impact approximation")
+    impact_frame = _phase_frame(frames, phases, IMPACT_PHASE)
     value = None
     frame_index = None
     origin = _point(address_frame, "nose") if address_frame else None
@@ -117,7 +126,7 @@ def _lead_arm_angle(
     context: AnalysisContext | None,
 ) -> MetricValue:
     side = "right" if context and context.handedness == "left" else "left"
-    top_frame = _phase_frame(frames, phases, "Top of backswing")
+    top_frame = _phase_frame(frames, phases, TOP_PHASE)
     if top_frame is not None:
         value = _joint_angle(
             top_frame, f"{side}_shoulder", f"{side}_elbow", f"{side}_wrist"
@@ -154,7 +163,7 @@ def _hip_sway(
     address_frame: LandmarkFrame | None,
     body_scale: float | None,
 ) -> MetricValue:
-    top_frame = _phase_frame(frames, phases, "Top of backswing")
+    top_frame = _phase_frame(frames, phases, TOP_PHASE)
     value = None
     frame_index = None
     origin = _midpoint(address_frame, "left_hip", "right_hip") if address_frame else None
@@ -193,8 +202,8 @@ def _knee_flex(frame: LandmarkFrame | None) -> MetricValue:
 def _posture_retention(
     frames: list[LandmarkFrame], phases: list[SwingPhase]
 ) -> MetricValue:
-    address = _phase_frame(frames, phases, "Address")
-    downswing = _phase_frame(frames, phases, "Downswing")
+    address = _phase_frame(frames, phases, ADDRESS_PHASE)
+    downswing = _phase_frame(frames, phases, P6_PHASE)
     address_angle = _spine_angle(address) if address else None
     downswing_angle = _spine_angle(downswing) if downswing else None
     value = (
@@ -206,7 +215,7 @@ def _posture_retention(
         name="Posture retention",
         value=value,
         unit="degrees change",
-        description="Change in spine inclination from address to downswing.",
+        description="Change in spine inclination from address to shaft-parallel downswing proxy.",
         frame_index=downswing.frame_index if value is not None and downswing else None,
     )
 
@@ -214,8 +223,8 @@ def _posture_retention(
 def _finish_stability(
     frames: list[LandmarkFrame], phases: list[SwingPhase], body_scale: float | None
 ) -> MetricValue:
-    follow = _phase_frame(frames, phases, "Follow-through")
-    finish = _phase_frame(frames, phases, "Finish")
+    follow = _phase_frame(frames, phases, P8_PHASE)
+    finish = _phase_frame(frames, phases, FINISH_PHASE)
     follow_head = _point(follow, "nose") if follow else None
     finish_head = _point(finish, "nose") if finish else None
     value = None
@@ -276,7 +285,7 @@ def _point(frame: LandmarkFrame, name: str) -> LandmarkPoint | None:
 def _phase_frame(
     frames: list[LandmarkFrame], phases: list[SwingPhase], name: str
 ) -> LandmarkFrame | None:
-    phase = next((item for item in phases if item.name == name), None)
+    phase = phase_by_name(phases).get(name)
     if phase is None or not frames:
         return None
     return min(frames, key=lambda frame: abs(frame.frame_index - phase.frame_index))

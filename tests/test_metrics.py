@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from analysis.metrics import calculate_metrics
 from analysis.models import AnalysisContext, SwingPhase
+from analysis.phases import IMPACT_PHASE, TOP_PHASE
 
 
 def test_calculate_metrics_from_landmarks(frame):
@@ -39,8 +40,8 @@ def test_calculate_metrics_from_landmarks(frame):
     ]
     phases = [
         SwingPhase(name="Address", frame_index=0, timestamp_seconds=0.0, confidence=1, detection_method="test"),
-        SwingPhase(name="Top of backswing", frame_index=15, timestamp_seconds=0.5, confidence=1, detection_method="test"),
-        SwingPhase(name="Impact approximation", frame_index=30, timestamp_seconds=0.75, confidence=1, detection_method="test"),
+        SwingPhase(name=TOP_PHASE, frame_index=15, timestamp_seconds=0.5, confidence=1, detection_method="test"),
+        SwingPhase(name=IMPACT_PHASE, frame_index=30, timestamp_seconds=0.75, confidence=1, detection_method="test"),
     ]
 
     metrics = calculate_metrics(frames, phases)
@@ -75,7 +76,7 @@ def test_lead_arm_metric_uses_handedness_at_top(frame):
     ]
     phases = [
         SwingPhase(name="Address", frame_index=0, timestamp_seconds=0.0, confidence=1, detection_method="test"),
-        SwingPhase(name="Top of backswing", frame_index=1, timestamp_seconds=0.1, confidence=1, detection_method="test"),
+        SwingPhase(name=TOP_PHASE, frame_index=1, timestamp_seconds=0.1, confidence=1, detection_method="test"),
     ]
     context = AnalysisContext(
         handedness="left", camera_view="face_on", club_family="iron"
@@ -125,8 +126,8 @@ def test_phase_scoped_metrics_do_not_use_post_swing_extrema(frame):
     ]
     phases = [
         SwingPhase(name="Address", frame_index=0, timestamp_seconds=0, confidence=1, detection_method="test"),
-        SwingPhase(name="Top of backswing", frame_index=5, timestamp_seconds=0.2, confidence=1, detection_method="test"),
-        SwingPhase(name="Impact approximation", frame_index=10, timestamp_seconds=0.3, confidence=1, detection_method="test"),
+        SwingPhase(name=TOP_PHASE, frame_index=5, timestamp_seconds=0.2, confidence=1, detection_method="test"),
+        SwingPhase(name=IMPACT_PHASE, frame_index=10, timestamp_seconds=0.3, confidence=1, detection_method="test"),
         SwingPhase(name="Finish", frame_index=20, timestamp_seconds=0.6, confidence=1, detection_method="test"),
     ]
 

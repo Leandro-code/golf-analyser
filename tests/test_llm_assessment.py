@@ -28,6 +28,7 @@ from analysis.models import (
     SwingPhase,
     VideoMetadata,
 )
+from analysis.phases import IMPACT_PHASE, P6_PHASE, TOP_PHASE
 from analysis.storage import load_analysis_result
 
 
@@ -55,6 +56,9 @@ class FakeResponses:
                         title="Improve transition control",
                         rationale="The transition frames suggest a quick change of direction.",
                         practice_cue="Rehearse a brief pause at the top before starting down.",
+                        explanation="This means smoothing the change of direction before the downswing.",
+                        drills=["Pause at the top before starting down."],
+                        practice_plan=["Make five slow rehearsals, then hit easy shots."],
                         supporting_frame_ids=["frame_000020", "frame_000040"],
                         related_metric_keys=["tempo_ratio"],
                         confidence=0.76,
@@ -81,10 +85,12 @@ def _result(tmp_path: Path, camera_view: str = "face_on") -> AnalysisResult:
     phases = [
         SwingPhase(name="Address", frame_index=0, timestamp_seconds=0.0, confidence=0.9, detection_method="test"),
         SwingPhase(name="Takeaway", frame_index=10, timestamp_seconds=1.0, confidence=0.9, detection_method="test"),
-        SwingPhase(name="Top of backswing", frame_index=20, timestamp_seconds=2.0, confidence=0.9, detection_method="test"),
-        SwingPhase(name="Downswing", frame_index=30, timestamp_seconds=3.0, confidence=0.9, detection_method="test"),
-        SwingPhase(name="Impact approximation", frame_index=40, timestamp_seconds=4.0, confidence=0.9, detection_method="test"),
-        SwingPhase(name="Follow-through", frame_index=50, timestamp_seconds=5.0, confidence=0.9, detection_method="test"),
+        SwingPhase(name="Lead arm parallel backswing (P3)", frame_index=15, timestamp_seconds=1.5, confidence=0.9, detection_method="test"),
+        SwingPhase(name=TOP_PHASE, frame_index=20, timestamp_seconds=2.0, confidence=0.9, detection_method="test"),
+        SwingPhase(name="Lead arm parallel downswing (P5)", frame_index=30, timestamp_seconds=3.0, confidence=0.9, detection_method="test"),
+        SwingPhase(name=P6_PHASE, frame_index=35, timestamp_seconds=3.5, confidence=0.9, detection_method="test"),
+        SwingPhase(name=IMPACT_PHASE, frame_index=40, timestamp_seconds=4.0, confidence=0.9, detection_method="test"),
+        SwingPhase(name="Shaft parallel follow-through (P8)", frame_index=50, timestamp_seconds=5.0, confidence=0.9, detection_method="test"),
         SwingPhase(name="Finish", frame_index=60, timestamp_seconds=6.0, confidence=0.9, detection_method="test"),
     ]
     metrics = MetricSet(
@@ -143,6 +149,12 @@ def test_generate_llm_assessment_sends_neighbor_frames_and_persists(tmp_path, mo
 
     assert updated.llm_assessment is not None
     assert updated.llm_assessment.model == "configured-model"
+    assert updated.llm_assessment.content.priorities[0].explanation.startswith(
+        "This means"
+    )
+    assert updated.llm_assessment.content.priorities[0].drills == [
+        "Pause at the top before starting down."
+    ]
     assert updated.artifacts.llm_assessment_json.exists()
     assert llm_assessment_is_current(updated) is True
     call = client.responses.calls[0]
@@ -156,7 +168,7 @@ def test_generate_llm_assessment_sends_neighbor_frames_and_persists(tmp_path, mo
     images = [
         item for item in call["input"][0]["content"] if item["type"] == "input_image"
     ]
-    assert len(images) == 9
+    assert len(images) == 12
     frame_ids = {frame.frame_id for frame in updated.llm_assessment.submitted_frames}
     assert {"frame_000000", "frame_000019", "frame_000020", "frame_000021"}.issubset(frame_ids)
     assert (updated.artifacts.llm_frames_dir / "frame_000020.jpg").exists()
@@ -184,9 +196,9 @@ def test_down_the_line_llm_assessment_includes_downswing_neighbors(tmp_path):
         for frame in updated.llm_assessment.submitted_frames
         for relation in frame.phase_relations
     }
-    assert "Downswing anchor" in relations
-    assert any(relation.startswith("Downswing -") for relation in relations)
-    assert any(relation.startswith("Downswing +") for relation in relations)
+    assert f"{P6_PHASE} anchor" in relations
+    assert any(relation.startswith(f"{P6_PHASE} -") for relation in relations)
+    assert any(relation.startswith(f"{P6_PHASE} +") for relation in relations)
 
 
 def test_llm_assessment_blocks_unreliable_inputs_and_unknown_frame_ids(tmp_path):
@@ -247,7 +259,7 @@ def test_saved_llm_assessment_reloads_and_becomes_stale_after_phase_change(tmp_p
         update={
             "phases": [
                 phase.model_copy(update={"frame_index": phase.frame_index + 1})
-                if phase.name == "Top of backswing"
+                if phase.name == TOP_PHASE
                 else phase
                 for phase in loaded.phases
             ]

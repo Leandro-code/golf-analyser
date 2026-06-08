@@ -24,6 +24,7 @@ from analysis.models import (
     SwingPhase,
     VideoMetadata,
 )
+from analysis.phases import IMPACT_PHASE, P6_PHASE, TOP_PHASE
 from analysis.storage import load_analysis_result
 
 
@@ -38,7 +39,7 @@ class FakeResponses:
                 summary="The supplied stills show an observable posture pattern.",
                 observations=[
                     AIReviewObservation(
-                        phase_name="Top of backswing",
+                        phase_name=TOP_PHASE,
                         observation="Lead arm position is visible at the labelled top.",
                         evidence_visible="The annotated arm line remains in view.",
                         confidence=0.8,
@@ -49,7 +50,7 @@ class FakeResponses:
                     AIReviewPriority(
                         focus="Maintain width",
                         practice_cue="Rehearse the top position slowly.",
-                        supporting_phases=["Top of backswing"],
+                        supporting_phases=[TOP_PHASE],
                     )
                 ],
                 limitations=["Still frames cannot establish strike outcome."],
@@ -66,11 +67,13 @@ def _result(tmp_path: Path, camera_view: str = "face_on") -> AnalysisResult:
     phases = [
         SwingPhase(name="Address", frame_index=0, timestamp_seconds=0.0, confidence=0.8, detection_method="test"),
         SwingPhase(name="Takeaway", frame_index=1, timestamp_seconds=0.1, confidence=0.8, detection_method="test"),
-        SwingPhase(name="Top of backswing", frame_index=2, timestamp_seconds=0.2, confidence=0.8, detection_method="test"),
-        SwingPhase(name="Downswing", frame_index=3, timestamp_seconds=0.3, confidence=0.8, detection_method="test"),
-        SwingPhase(name="Impact approximation", frame_index=4, timestamp_seconds=0.4, confidence=0.8, detection_method="test"),
-        SwingPhase(name="Follow-through", frame_index=5, timestamp_seconds=0.5, confidence=0.8, detection_method="test"),
-        SwingPhase(name="Finish", frame_index=6, timestamp_seconds=0.6, confidence=0.8, detection_method="test"),
+        SwingPhase(name="Lead arm parallel backswing (P3)", frame_index=2, timestamp_seconds=0.2, confidence=0.8, detection_method="test"),
+        SwingPhase(name=TOP_PHASE, frame_index=3, timestamp_seconds=0.3, confidence=0.8, detection_method="test"),
+        SwingPhase(name="Lead arm parallel downswing (P5)", frame_index=4, timestamp_seconds=0.4, confidence=0.8, detection_method="test"),
+        SwingPhase(name=P6_PHASE, frame_index=5, timestamp_seconds=0.5, confidence=0.8, detection_method="test"),
+        SwingPhase(name=IMPACT_PHASE, frame_index=6, timestamp_seconds=0.6, confidence=0.8, detection_method="test"),
+        SwingPhase(name="Shaft parallel follow-through (P8)", frame_index=7, timestamp_seconds=0.7, confidence=0.8, detection_method="test"),
+        SwingPhase(name="Finish", frame_index=8, timestamp_seconds=0.8, confidence=0.8, detection_method="test"),
     ]
     metrics = MetricSet(
         metrics={
@@ -108,20 +111,20 @@ def _result(tmp_path: Path, camera_view: str = "face_on") -> AnalysisResult:
     keyframes.mkdir(parents=True)
     for name in (
         "address.jpg",
-        "top_of_backswing.jpg",
-        "downswing.jpg",
-        "impact_approximation.jpg",
-        "finish.jpg",
+            "top_p4.jpg",
+            "shaft_parallel_downswing_p6.jpg",
+            "impact_approximation_p7.jpg",
+            "finish.jpg",
     ):
         (keyframes / name).write_bytes(b"jpeg")
     return AnalysisResult(
         metadata=VideoMetadata(
             source_path="input.mp4",
             fps=10,
-            frame_count=7,
+            frame_count=9,
             width=64,
             height=64,
-            duration_seconds=0.7,
+            duration_seconds=0.9,
         ),
         landmarks=[],
         phases=phases,
@@ -176,7 +179,7 @@ def test_down_the_line_review_includes_downswing_image(tmp_path):
         for item in client.responses.calls[0]["input"][0]["content"]
         if item["type"] == "input_text"
     ]
-    assert any("Phase image: Downswing" in text for text in text_items)
+    assert any(f"Phase image: {P6_PHASE}" in text for text in text_items)
 
 
 def test_saved_ai_review_reloads_with_analysis_history(tmp_path):
@@ -237,7 +240,7 @@ def test_ai_review_is_blocked_for_unreliable_or_changed_evidence(tmp_path):
     generated = generate_ai_review(result, client=client)
     changed_phases = [
         phase.model_copy(update={"frame_index": phase.frame_index + 1})
-        if phase.name == "Top of backswing"
+        if phase.name == TOP_PHASE
         else phase
         for phase in generated.phases
     ]

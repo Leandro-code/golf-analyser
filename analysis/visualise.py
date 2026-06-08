@@ -10,6 +10,7 @@ import cv2
 from imageio_ffmpeg import get_ffmpeg_exe
 
 from analysis.models import LandmarkFrame, LandmarkPoint, SwingAssessment, SwingPhase
+from analysis.phases import LEGACY_PHASE_ALIASES, PHASE_NAMES
 
 
 POSE_CONNECTIONS = [
@@ -41,6 +42,10 @@ def render_annotated_video(
     keyframes_dir.mkdir(parents=True, exist_ok=True)
     for existing in keyframes_dir.glob("finding_*.jpg"):
         existing.unlink()
+    for phase_name in [*PHASE_NAMES, *LEGACY_PHASE_ALIASES]:
+        (keyframes_dir / f"{_safe_phase_filename(phase_name)}.jpg").unlink(
+            missing_ok=True
+        )
     cap = cv2.VideoCapture(str(source_video))
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video for visualisation: {source_video}")
@@ -263,4 +268,10 @@ def _pixel(point: LandmarkPoint) -> tuple[int, int]:
 
 
 def _safe_phase_filename(name: str) -> str:
-    return name.lower().replace(" ", "_").replace("-", "_")
+    return (
+        name.lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )

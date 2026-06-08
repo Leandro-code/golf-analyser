@@ -17,6 +17,17 @@ from analysis.models import (
     LLMAssessmentContent,
     SubmittedEvidenceFrame,
 )
+from analysis.phases import (
+    ADDRESS_PHASE,
+    FINISH_PHASE,
+    IMPACT_PHASE,
+    P3_PHASE,
+    P5_PHASE,
+    P6_PHASE,
+    P8_PHASE,
+    TOP_PHASE,
+    phase_by_name,
+)
 from analysis.visualise import annotate_frame
 
 
@@ -42,10 +53,17 @@ target ranges, hidden standards, or normative thresholds. Use support_type
 ai_generated for every priority because no source-backed reference ranges are
 provided.
 
+For each priority, include explanation, drills, and practice_plan fields that help
+the golfer understand what the priority means, rehearse it, and check progress.
+Keep drills and plan steps concrete, short, and grounded in the supplied evidence.
+Do not introduce claims that are unsupported by the supplied 2D pose frames,
+measurements, or quality metadata.
+
 Limit analysis to visible 2D pose observations. Do not claim club path, clubface
 angle, strike/contact quality, ball flight, distance, power, overall score,
-medical diagnosis, or comparison to a professional golfer. Include limitations
-when images or 2D pose evidence cannot support a conclusion.
+medical diagnosis, or comparison to a professional golfer. Treat shaft-parallel
+phase labels as body-pose timing proxies, not observed shaft measurements.
+Include limitations when images or 2D pose evidence cannot support a conclusion.
 """.strip()
 
 
@@ -158,7 +176,7 @@ def llm_assessment_eligibility_issue(result: AnalysisResult) -> str | None:
             "AI swing assessment is withheld until pose evidence and phase timing "
             "are reliable."
         )
-    by_name = {phase.name for phase in result.phases}
+    by_name = phase_by_name(result.phases)
     if any(name not in by_name for name in _review_phase_names(result)):
         return "Required review phase markers are unavailable for this analysis."
     if not result.artifacts.original_video.exists():
@@ -192,9 +210,9 @@ def llm_assessment_fingerprint(
 
 
 def _select_frames(result: AnalysisResult) -> list[SubmittedEvidenceFrame]:
-    by_name = {phase.name: phase for phase in result.phases}
-    address = by_name["Address"].frame_index
-    finish = by_name["Finish"].frame_index
+    by_name = phase_by_name(result.phases)
+    address = by_name[ADDRESS_PHASE].frame_index
+    finish = by_name[FINISH_PHASE].frame_index
     neighbor_frames = max(1, round(result.metadata.fps * NEIGHBOR_SECONDS))
     relation_map: dict[int, set[str]] = {}
 
@@ -202,14 +220,14 @@ def _select_frames(result: AnalysisResult) -> list[SubmittedEvidenceFrame]:
         clipped = max(address, min(finish, index))
         relation_map.setdefault(clipped, set()).add(relation)
 
-    add_frame(address, "Address anchor")
+    add_frame(address, f"{ADDRESS_PHASE} anchor")
     for phase_name in _review_phase_names(result):
-        if phase_name == "Address":
+        if phase_name == ADDRESS_PHASE:
             continue
         phase = by_name[phase_name]
         offsets = (
             [-neighbor_frames, 0, neighbor_frames]
-            if phase_name in {"Top of backswing", "Impact approximation", "Downswing", "Finish"}
+            if phase_name in {TOP_PHASE, P6_PHASE, IMPACT_PHASE, FINISH_PHASE}
             else [0]
         )
         for offset in offsets:
@@ -237,10 +255,10 @@ def _select_frames(result: AnalysisResult) -> list[SubmittedEvidenceFrame]:
 
 
 def _review_phase_names(result: AnalysisResult) -> list[str]:
-    names = ["Address", "Top of backswing"]
+    names = [ADDRESS_PHASE, P3_PHASE, TOP_PHASE, P5_PHASE]
     if result.assessment and result.assessment.context.camera_view == "down_the_line":
-        names.append("Downswing")
-    names.extend(["Impact approximation", "Finish"])
+        names.append(P6_PHASE)
+    names.extend([IMPACT_PHASE, P8_PHASE, FINISH_PHASE])
     return names
 
 

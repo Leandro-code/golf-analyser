@@ -120,23 +120,23 @@ class SwingAnalyser:
     def confirm_phase_markers(
         self,
         result: AnalysisResult,
-        address_index: int,
-        top_index: int,
-        impact_index: int,
-        finish_index: int,
+        *phase_indices: int,
     ) -> AnalysisResult:
+        if not phase_indices:
+            raise ValueError("At least one phase marker is required.")
         phases = build_confirmed_phases(
-            address_index,
-            top_index,
-            impact_index,
-            finish_index,
-            result.metadata.fps,
+            phase_indices[0],
+            *phase_indices[1:],
+            fps=result.metadata.fps,
         )
         return self._regenerate_from_phases(result, phases)
 
     def redetect_phases(self, result: AnalysisResult) -> AnalysisResult:
         phases = detect_swing_phases(result.landmarks, result.metadata.fps)
         return self._regenerate_from_phases(result, phases)
+
+    def reassess_with_current_phase_model(self, result: AnalysisResult) -> AnalysisResult:
+        return self.redetect_phases(result)
 
     def _regenerate_from_phases(
         self,

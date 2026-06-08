@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
 from streamlit.testing.v1 import AppTest
 
 from analysis.assessment import assess_swing
-from analysis.models import AnalysisContext, MetricSet, MetricValue, SwingPhase
+from analysis.llm_assessment import _select_frames, llm_assessment_fingerprint
+from analysis.models import (
+    AnalysisContext,
+    LLMAssessment,
+    LLMAssessmentContent,
+    LLMPriority,
+    MetricSet,
+    MetricValue,
+    SwingPhase,
+)
+from analysis.phases import IMPACT_PHASE, P6_PHASE, TOP_PHASE
+from analysis.storage import load_analysis_result
 
 
 def test_new_analysis_requires_capture_context_controls():
@@ -27,9 +39,14 @@ def _write_assessed_run(tmp_path, detection_method: str = "test"):
     run_dir.mkdir()
     phases = [
         SwingPhase(name="Address", frame_index=0, timestamp_seconds=0.0, confidence=0.8, detection_method=detection_method),
-        SwingPhase(name="Top of backswing", frame_index=1, timestamp_seconds=1.0, confidence=0.8, detection_method=detection_method),
-        SwingPhase(name="Impact approximation", frame_index=2, timestamp_seconds=1.2, confidence=0.8, detection_method=detection_method),
-        SwingPhase(name="Finish", frame_index=3, timestamp_seconds=1.8, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name="Takeaway", frame_index=1, timestamp_seconds=0.3, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name="Lead arm parallel backswing (P3)", frame_index=2, timestamp_seconds=0.6, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name=TOP_PHASE, frame_index=3, timestamp_seconds=1.0, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name="Lead arm parallel downswing (P5)", frame_index=4, timestamp_seconds=1.1, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name=P6_PHASE, frame_index=5, timestamp_seconds=1.15, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name=IMPACT_PHASE, frame_index=6, timestamp_seconds=1.2, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name="Shaft parallel follow-through (P8)", frame_index=7, timestamp_seconds=1.5, confidence=0.8, detection_method=detection_method),
+        SwingPhase(name="Finish", frame_index=8, timestamp_seconds=1.8, confidence=0.8, detection_method=detection_method),
     ]
     metrics = MetricSet(
         metrics={
@@ -47,8 +64,8 @@ def _write_assessed_run(tmp_path, detection_method: str = "test"):
     (run_dir / "keyframes").mkdir()
     for name in (
         "address.jpg",
-        "top_of_backswing.jpg",
-        "impact_approximation.jpg",
+        "top_p4.jpg",
+        "impact_approximation_p7.jpg",
         "finish.jpg",
     ):
         assert cv2.imwrite(
@@ -61,7 +78,7 @@ def _write_assessed_run(tmp_path, detection_method: str = "test"):
                 "metadata": {
                     "source_path": "test.mp4",
                     "fps": 30,
-                    "frame_count": 4,
+                    "frame_count": 9,
                     "width": 64,
                     "height": 64,
                     "duration_seconds": 0.13,
@@ -104,6 +121,58 @@ def test_history_offers_primary_opt_in_ai_swing_assessment(tmp_path, monkeypatch
     assert any(button.label == "Generate AI swing assessment" for button in app.button)
     assert any("Model-generated swing assessment" in item.value for item in app.caption)
     assert any("Measured Pose Data" in expander.label for expander in app.expander)
+
+
+def test_history_renders_priority_drilldown_for_current_ai_assessment(tmp_path, monkeypatch):
+    run_dir = _write_assessed_run(tmp_path)
+    result = load_analysis_result(run_dir)
+    submitted_frames = _select_frames(result)
+    llm_assessment = LLMAssessment(
+        schema_version="1.0.0",
+        prompt_version="1.0.0",
+        model="test-model",
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        context=result.assessment.context,
+        submitted_frames=submitted_frames,
+        quality_snapshot=result.metrics.quality,
+        evidence_fingerprint=llm_assessment_fingerprint(result, submitted_frames),
+        content=LLMAssessmentContent(
+            overview="The selected frames show a usable swing sequence.",
+            priorities=[
+                LLMPriority(
+                    title="Keep posture stable",
+                    rationale="The top and impact frames show posture movement.",
+                    practice_cue="Make slow-motion swings while keeping chest distance stable.",
+                    explanation="This means checking whether the torso position holds through transition.",
+                    drills=["Pause at the top, then rehearse halfway down."],
+                    practice_plan=["Make five slow rehearsals before hitting easy shots."],
+                    supporting_frame_ids=[submitted_frames[0].frame_id],
+                    related_metric_keys=["tempo_ratio"],
+                    confidence=0.8,
+                )
+            ],
+        ),
+    )
+    (run_dir / "llm_assessment.json").write_text(
+        llm_assessment.model_dump_json(), encoding="utf-8"
+    )
+    monkeypatch.setenv("GOLF_ANALYSER_OUTPUTS_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    app = AppTest.from_file("app/streamlit_app.py").run(timeout=10)
+    app.segmented_control[0].set_value("History").run(timeout=10)
+
+    assert not app.exception
+    assert any("Explore this priority" in expander.label for expander in app.expander)
+    assert any(
+        "This means checking whether the torso position holds through transition."
+        in markdown.value
+        for markdown in app.markdown
+    )
+    assert any(
+        "Pause at the top, then rehearse halfway down." in markdown.value
+        for markdown in app.markdown
+    )
 
 
 def test_history_withholds_guidance_from_superseded_phase_detection(tmp_path, monkeypatch):

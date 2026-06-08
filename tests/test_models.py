@@ -5,6 +5,7 @@ from pathlib import Path
 from analysis.models import (
     AnalysisArtifacts,
     AnalysisResult,
+    LLMPriority,
     MetricSet,
     SwingPhase,
     VideoMetadata,
@@ -48,3 +49,20 @@ def test_analysis_result_serializes_paths_to_json():
     assert "outputs/swing_test/annotated.mp4" in json_payload
     assert "Address" in json_payload
 
+
+def test_llm_priority_accepts_legacy_payload_without_drilldown_fields():
+    priority = LLMPriority.model_validate(
+        {
+            "title": "Improve transition control",
+            "rationale": "The transition frames suggest a quick change of direction.",
+            "practice_cue": "Rehearse a brief pause at the top before starting down.",
+            "supporting_frame_ids": ["frame_000020"],
+            "related_metric_keys": ["tempo_ratio"],
+            "confidence": 0.76,
+            "support_type": "ai_generated",
+        }
+    )
+
+    assert priority.explanation is None
+    assert priority.drills == []
+    assert priority.practice_plan == []
