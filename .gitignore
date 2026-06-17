@@ -12,3 +12,6 @@ outputs/
 *.pyo
 *.pyd
 *.log
+node_modules/
+mobile/.expo/
+mobile/coverage/

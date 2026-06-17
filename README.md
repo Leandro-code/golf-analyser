@@ -72,6 +72,112 @@ Historical runs created before contextual feedback remain viewable, but do not r
 
 The project disables pytest output capture in `pytest.ini` because MediaPipe/OpenGL logging can break pytest's default capture backend in some WSL temp-directory setups.
 
+## Run the Dev Environment
+
+For mobile/API development, start the backend and client in separate terminals.
+
+Terminal 1, from the repo root:
+
+```bash
+cd /home/larranz/projects/golf-analyser
+.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Check the API at <http://localhost:8000/health>.
+
+Terminal 2, for Expo:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm start
+```
+
+For browser testing instead of Expo Go:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm run start -- --web
+```
+
+Then open <http://localhost:8081>.
+
+Run `npm install` in `mobile/` only for first-time setup or after mobile
+dependency changes. If Expo reports missing web support, run
+`npx expo install react-native-web react-dom` once from `mobile/`.
+
+## Run the API
+
+The FastAPI backend wraps the same `analysis/` pipeline and stores completed runs
+under `outputs/` by default. For local testing, start it from the repo root:
+
+```bash
+cd /home/larranz/projects/golf-analyser
+.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Check that it is running at <http://localhost:8000/health>.
+
+Set `GOLF_ANALYSER_API_TOKEN` to require `Authorization: Bearer <token>` on API
+routes except `/health`. Set `GOLF_ANALYSER_OUTPUTS_DIR` to point the API at a
+different local run directory.
+
+Implemented endpoints:
+
+```text
+GET  /health
+POST /analyses
+GET  /analyses
+GET  /analyses/{run_id}
+GET  /analyses/{run_id}/status
+GET  /analyses/{run_id}/artifacts/{artifact_name}
+POST /analyses/{run_id}/phases/redetect
+POST /analyses/{run_id}/phases/confirm
+POST /analyses/{run_id}/llm-assessment
+```
+
+Analysis jobs run asynchronously in a local in-process worker. Completed jobs are
+recoverable from saved `outputs/swing_*` directories.
+
+## Run the Mobile Client
+
+The first mobile client is in `mobile/` and uses Expo/React Native. Install
+dependencies once before the first run:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+npm install
+```
+
+Start the mobile client with the API URL:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm start
+```
+
+For browser testing, start Expo in web mode:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm run start -- --web
+```
+
+Then open <http://localhost:8081>.
+
+If Expo reports missing web support, install the web dependencies once:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+npx expo install react-native-web react-dom
+```
+
+For Expo Go on a physical phone, replace `localhost` with the computer's LAN IP,
+for example `EXPO_PUBLIC_API_BASE_URL=http://192.168.1.23:8000`.
+
+Set `EXPO_PUBLIC_API_TOKEN` when the backend token is enabled. The client can
+choose/import a swing video, submit capture context, poll processing status,
+show replay/results/history, and confirm all nine phase markers.
+
 ## Scope
 
 This milestone intentionally excludes club tracking, ball flight tracking, live camera capture, cloud deployment, authentication, custom ML models, scoring, pro comparison, and Android implementation. Optional AI swing assessment is limited to visible 2D still-image observations and local pose measurements.
