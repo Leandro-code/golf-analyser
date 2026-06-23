@@ -92,6 +92,10 @@ cd /home/larranz/projects/golf-analyser/mobile
 EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm start
 ```
 
+The API loads `OPENAI_API_KEY` and `GOLF_ANALYSER_OPENAI_MODEL` from the
+repository `.env` file when it starts, so AI coaching can be requested from the
+mobile client without exposing the OpenAI key to Expo.
+
 For browser testing instead of Expo Go:
 
 ```bash
@@ -172,11 +176,15 @@ npx expo install react-native-web react-dom
 ```
 
 For Expo Go on a physical phone, replace `localhost` with the computer's LAN IP,
-for example `EXPO_PUBLIC_API_BASE_URL=http://192.168.1.23:8000`.
+for example `EXPO_PUBLIC_API_BASE_URL=http://192.168.1.23:8000`. Start Uvicorn
+with `--host 0.0.0.0`, keep the phone and computer on the same Wi-Fi or hotspot,
+and allow inbound port `8000` through the computer firewall if needed.
 
 Set `EXPO_PUBLIC_API_TOKEN` when the backend token is enabled. The client can
 choose/import a swing video, submit capture context, poll processing status,
-show replay/results/history, and confirm all nine phase markers.
+show the annotated replay, explicitly generate the full AI coaching report,
+reopen saved reports from history, and confirm all nine phase markers. A failed
+upload keeps the selected clip available for a session-level retry.
 
 ## Scope
 

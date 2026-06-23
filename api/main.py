@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
@@ -27,6 +28,12 @@ from api.jobs import JobManager, save_upload
 
 
 app = FastAPI(title="Golf Analyser API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @lru_cache

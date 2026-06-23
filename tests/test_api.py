@@ -27,6 +27,19 @@ def test_health():
     assert TestClient(api_main.app).get("/health").json() == {"status": "ok"}
 
 
+def test_local_web_client_cors_preflight():
+    response = TestClient(api_main.app).options(
+        "/analyses",
+        headers={
+            "Origin": "http://localhost:8081",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:8081"
+
+
 def test_create_analysis_job_with_valid_context(tmp_path, monkeypatch):
     _configure_api(tmp_path, monkeypatch)
 
