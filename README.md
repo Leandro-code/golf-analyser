@@ -74,7 +74,8 @@ The project disables pytest output capture in `pytest.ini` because MediaPipe/Ope
 
 ## Run the Dev Environment
 
-For mobile/API development, start the backend and client in separate terminals.
+For Android/API development, start the backend and native Android client in
+separate terminals.
 
 Terminal 1, from the repo root:
 
@@ -83,31 +84,16 @@ cd /home/larranz/projects/golf-analyser
 .venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+The API loads `OPENAI_API_KEY` and `GOLF_ANALYSER_OPENAI_MODEL` from the
+repository `.env` file when it starts, so AI assessment requests remain
+server-side and no OpenAI key is exposed to Android.
+
 Check the API at <http://localhost:8000/health>.
 
-Terminal 2, for Expo:
-
-```bash
-cd /home/larranz/projects/golf-analyser/mobile
-EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm start
-```
-
-The API loads `OPENAI_API_KEY` and `GOLF_ANALYSER_OPENAI_MODEL` from the
-repository `.env` file when it starts, so AI coaching can be requested from the
-mobile client without exposing the OpenAI key to Expo.
-
-For browser testing instead of Expo Go:
-
-```bash
-cd /home/larranz/projects/golf-analyser/mobile
-EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm run start -- --web
-```
-
-Then open <http://localhost:8081>.
-
-Run `npm install` in `mobile/` only for first-time setup or after mobile
-dependency changes. If Expo reports missing web support, run
-`npx expo install react-native-web react-dom` once from `mobile/`.
+Terminal 2, open `android/` in Android Studio or run Gradle from that directory.
+The debug default points an emulator at `http://10.0.2.2:8000`. For a physical
+device, set the Android API base URL to the computer's LAN IP, for example
+`http://192.168.1.23:8000`, and allow inbound port `8000` through the firewall.
 
 ## Run the API
 
@@ -142,10 +128,34 @@ POST /analyses/{run_id}/llm-assessment
 Analysis jobs run asynchronously in a local in-process worker. Completed jobs are
 recoverable from saved `outputs/swing_*` directories.
 
-## Run the Mobile Client
+## Run the Native Android Client
 
-The first mobile client is in `mobile/` and uses Expo/React Native. Install
-dependencies once before the first run:
+The Stage 1 Android client is in `android/` and uses Kotlin, Jetpack Compose,
+Material 3, Retrofit/OkHttp, and Media3. It talks to the FastAPI backend and
+keeps pose analysis, phase detection, replay rendering, persistence, and OpenAI
+calls on the Python side.
+
+From `android/`, build or run the app with Android Studio or Gradle:
+
+```bash
+cd /home/larranz/projects/golf-analyser/android
+./gradlew :app:assembleDebug
+```
+
+If the backend token is enabled, pass it to Gradle:
+
+```bash
+./gradlew :app:assembleDebug -PGOLF_ANALYSER_API_TOKEN=secret
+```
+
+The native app can choose/import a swing video, submit capture context, poll
+processing status, play the annotated replay, generate the AI assessment, reopen
+saved analyses, and confirm all nine phase markers.
+
+## Legacy Expo Client
+
+The older Expo/React Native client remains in `mobile/` as a prototype and web
+test harness. Install dependencies once before the first run:
 
 ```bash
 cd /home/larranz/projects/golf-analyser/mobile
@@ -182,10 +192,14 @@ and allow inbound port `8000` through the computer firewall if needed.
 
 Set `EXPO_PUBLIC_API_TOKEN` when the backend token is enabled. The client can
 choose/import a swing video, submit capture context, poll processing status,
-show the annotated replay, explicitly generate the full AI coaching report,
-reopen saved reports from history, and confirm all nine phase markers. A failed
-upload keeps the selected clip available for a session-level retry.
+show the annotated replay, generate AI coaching, reopen saved reports from
+history, and confirm all nine phase markers. A failed upload keeps the selected
+clip available for a session-level retry.
 
 ## Scope
 
-This milestone intentionally excludes club tracking, ball flight tracking, live camera capture, cloud deployment, authentication, custom ML models, scoring, pro comparison, and Android implementation. Optional AI swing assessment is limited to visible 2D still-image observations and local pose measurements.
+This milestone intentionally excludes on-device pose analysis, club tracking,
+ball flight tracking, live camera capture, cloud deployment, account
+authentication, custom ML models, scoring, and pro comparison. AI swing
+assessment is limited to visible 2D still-image observations and local pose
+measurements, and must be explicitly requested by the user.

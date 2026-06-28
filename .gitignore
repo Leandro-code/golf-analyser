@@ -15,3 +15,6 @@ outputs/
 node_modules/
 mobile/.expo/
 mobile/coverage/
+android/.gradle/
+android/**/build/
+android/local.properties

@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+set -eu
+
+if ! command -v gradle >/dev/null 2>&1; then
+  echo "Gradle is not installed. Open this project in Android Studio or install Gradle and Java." >&2
+  exit 127
+fi
+
+exec gradle "$@"
