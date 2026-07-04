@@ -1,5 +1,6 @@
 package com.golfanalyser.app.ui
 
+import android.content.Intent
 import android.net.Uri
 import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -43,7 +44,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -54,7 +57,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.golfanalyser.app.data.AnalysisResultResponse
 import com.golfanalyser.app.data.AssessmentFindingDto
@@ -112,8 +118,17 @@ private fun AppScaffold(
 
 @Composable
 private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        if (uri != null) viewModel.selectVideo(uri)
+    val context = LocalContext.current
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+            viewModel.selectVideo(uri)
+        }
     }
     AppScaffold(
         title = "New swing",
@@ -140,7 +155,7 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
             }
             item {
                 Button(
-                    onClick = { picker.launch("video/*") },
+                    onClick = { picker.launch(arrayOf("video/*")) },
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(if (state.selectedVideo == null) "Choose swing video" else "Change selected video")
@@ -233,7 +248,10 @@ private fun ProcessingScreen(state: AppUiState) {
 private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
     AppScaffold(
         title = "Saved analyses",
-        actions = { TextButton(onClick = viewModel::showNewSwing) { Text("New") } },
+        actions = {
+            TextButton(onClick = viewModel::clearDownloadedReplays) { Text("Clear replays") }
+            TextButton(onClick = viewModel::showNewSwing) { Text("New") }
+        },
     ) { padding ->
         LazyColumn(
             modifier = Modifier
@@ -245,10 +263,11 @@ private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
             if (state.isBusy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
             if (state.error != null) item { ErrorBanner(state.error) }
             items(state.history) { result ->
-                Card(onClick = { viewModel.showResult(result) }) {
+                Card(onClick = { viewModel.openHistoryResult(result.runId) }) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(result.runId, fontWeight = FontWeight.Bold)
                         Text(result.context?.let { "${it.cameraView.readable()} / ${it.clubFamily.readable()}" } ?: "Legacy run")
+                        if (result.llmAssessmentCurrent) Text("AI assessment ready", color = MaterialTheme.colorScheme.primary)
                         if (result.llmAssessmentStale) Text("AI assessment is stale", color = Color(0xFF8A3B12))
                     }
                 }
@@ -275,9 +294,7 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             item {
-                result.artifactUrls["annotated_video"]?.let { path ->
-                    VideoPlayer(viewModel.artifactUrl(path))
-                }
+                ReplayPanel(state.replayState, viewModel::retryReplayDownload)
             }
             item {
                 ResultHeader(result)
@@ -308,6 +325,49 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
 }
 
 @Composable
+private fun ReplayPanel(replayState: ReplayState, onRetry: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(9f / 16f)
+            .background(Color.Black),
+        contentAlignment = Alignment.Center,
+    ) {
+        when (replayState) {
+            ReplayState.NotLoaded -> {
+                Button(onClick = onRetry) {
+                    Text("Download replay")
+                }
+            }
+            ReplayState.Downloading -> {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(color = Color.White)
+                    Text("Downloading replay...", color = Color.White)
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+            is ReplayState.Failed -> {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(replayState.message, color = Color.White)
+                    Button(onClick = onRetry) {
+                        Text("Retry download")
+                    }
+                }
+            }
+            is ReplayState.Ready -> VideoPlayer(replayState.uri)
+        }
+    }
+}
+
+@Composable
 private fun ResultHeader(result: AnalysisResultResponse) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text("Swing analysis", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
@@ -324,6 +384,7 @@ private fun ResultHeader(result: AnalysisResultResponse) {
 @Composable
 private fun VideoPlayer(url: String) {
     val context = LocalContext.current
+    var videoAspectRatio by remember(url) { mutableStateOf(9f / 16f) }
     val player = remember(url) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(url))
@@ -331,21 +392,38 @@ private fun VideoPlayer(url: String) {
         }
     }
     DisposableEffect(player) {
-        onDispose { player.release() }
+        val listener = object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    val pixelRatio = videoSize.pixelWidthHeightRatio.takeIf { it > 0f } ?: 1f
+                    videoAspectRatio = (videoSize.width * pixelRatio) / videoSize.height
+                }
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
     }
     AndroidView(
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+            .aspectRatio(videoAspectRatio)
             .background(Color.Black),
         factory = {
             PlayerView(it).apply {
                 this.player = player
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                 layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT,
                 )
             }
+        },
+        update = {
+            it.player = player
+            it.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
         },
     )
 }
@@ -365,18 +443,44 @@ private fun AiAssessmentCard(result: AnalysisResultResponse, isGenerating: Boole
                     }
                 }
                 assessment == null -> {
-                    Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
-                    Button(
-                        onClick = viewModel::generateAiAssessment,
-                        enabled = !isGenerating,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text(if (isGenerating) "Generating..." else "Generate AI assessment")
+                    if (isGenerating) {
+                        AiAssessmentLoading()
+                    } else {
+                        Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
+                        Button(
+                            onClick = viewModel::generateAiAssessment,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Generate AI assessment")
+                        }
                     }
                 }
                 else -> LlmAssessmentContent(assessment)
             }
         }
+    }
+}
+
+@Composable
+private fun AiAssessmentLoading() {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(
+                modifier = Modifier
+                    .width(28.dp)
+                    .height(28.dp),
+                strokeWidth = 3.dp,
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Generating AI assessment", fontWeight = FontWeight.Bold)
+                Text("Preparing swing evidence and waiting for the model response.")
+            }
+        }
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        Text("This can take about a minute for the first request.")
     }
 }
 

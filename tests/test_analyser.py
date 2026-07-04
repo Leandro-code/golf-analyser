@@ -130,16 +130,28 @@ def test_browser_playback_transcodes_existing_opencv_video_without_rewriting_sou
     assert _video_fourcc(playback_video) in {"avc1", "h264", "H264"}
 
 
-def _write_blank_video(path):
+def test_browser_playback_transcode_caps_large_mobile_video(tmp_path):
+    legacy_video = tmp_path / "large_portrait.mp4"
+    _write_blank_video(legacy_video, size=(1080, 1920), frame_count=2)
+
+    playback_video = browser_playback_video(legacy_video)
+
+    width, height = _video_size(playback_video)
+    assert max(width, height) <= 1280
+    assert width < height
+
+
+def _write_blank_video(path, size=(64, 64), frame_count=5):
     writer = cv2.VideoWriter(
         str(path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         5,
-        (64, 64),
+        size,
     )
     assert writer.isOpened()
-    for _ in range(5):
-        frame = np.full((64, 64, 3), 245, dtype=np.uint8)
+    width, height = size
+    for _ in range(frame_count):
+        frame = np.full((height, width, 3), 245, dtype=np.uint8)
         writer.write(frame)
     writer.release()
 
@@ -150,3 +162,12 @@ def _video_fourcc(path):
     code = int(cap.get(cv2.CAP_PROP_FOURCC))
     cap.release()
     return "".join(chr((code >> (8 * index)) & 0xFF) for index in range(4))
+
+
+def _video_size(path):
+    cap = cv2.VideoCapture(str(path))
+    assert cap.isOpened()
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return width, height

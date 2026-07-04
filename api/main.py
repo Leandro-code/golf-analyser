@@ -10,7 +10,11 @@ from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
 from analysis import AnalysisContext, SwingAnalyser, list_analysis_runs, load_analysis_result
-from analysis.llm_assessment import LLMAssessmentError, generate_llm_assessment
+from analysis.llm_assessment import (
+    LLMAssessmentError,
+    generate_llm_assessment,
+    llm_assessment_is_current,
+)
 
 from api.artifacts import artifact_path
 from api.auth import require_bearer_token
@@ -181,6 +185,8 @@ def create_llm_assessment(
     settings: ApiSettings = Depends(get_settings),
 ) -> AnalysisResultResponse:
     result = _load_or_404(settings.outputs_dir, run_id)
+    if llm_assessment_is_current(result):
+        return result_to_response(result)
     try:
         updated = generate_llm_assessment(result)
     except LLMAssessmentError as exc:

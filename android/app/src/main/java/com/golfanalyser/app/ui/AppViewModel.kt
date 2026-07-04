@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.golfanalyser.app.data.AnalysisRepository
 import com.golfanalyser.app.data.AnalysisResultResponse
 import com.golfanalyser.app.data.AnalysisStatusResponse
+import com.golfanalyser.app.data.ArtifactCache
 import com.golfanalyser.app.data.ContextPayload
 import com.golfanalyser.app.data.buildPhaseConfirmationPayload
 import kotlinx.coroutines.Job
@@ -27,6 +28,13 @@ val phaseOrder = listOf(
     "Finish",
 )
 
+sealed interface ReplayState {
+    data object NotLoaded : ReplayState
+    data object Downloading : ReplayState
+    data class Ready(val uri: String) : ReplayState
+    data class Failed(val message: String) : ReplayState
+}
+
 data class AppUiState(
     val screen: Screen = Screen.NewSwing,
     val selectedVideo: Uri? = null,
@@ -39,6 +47,7 @@ data class AppUiState(
     val result: AnalysisResultResponse? = null,
     val history: List<AnalysisResultResponse> = emptyList(),
     val phaseFrames: Map<String, String> = emptyMap(),
+    val replayState: ReplayState = ReplayState.NotLoaded,
     val isBusy: Boolean = false,
     val isGeneratingAi: Boolean = false,
     val message: String? = null,
@@ -54,10 +63,11 @@ enum class Screen {
 }
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = AnalysisRepository(application.contentResolver)
+    private val repository = AnalysisRepository(application.contentResolver, application.cacheDir)
     private val _uiState = MutableStateFlow(AppUiState())
     val uiState: StateFlow<AppUiState> = _uiState
     private var pollingJob: Job? = null
+    private var replayJob: Job? = null
 
     fun selectVideo(uri: Uri) {
         _uiState.update { it.copy(selectedVideo = uri, error = null, message = null) }
@@ -69,13 +79,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun showNewSwing() {
         pollingJob?.cancel()
+        replayJob?.cancel()
         _uiState.update {
             it.copy(
                 screen = Screen.NewSwing,
                 status = null,
                 result = null,
                 phaseFrames = emptyMap(),
+                replayState = ReplayState.NotLoaded,
                 isBusy = false,
+                isGeneratingAi = false,
                 error = null,
                 message = null,
             )
@@ -83,16 +96,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun showResult(result: AnalysisResultResponse) {
+        replayJob?.cancel()
         _uiState.update {
             it.copy(
                 screen = Screen.Result,
                 result = result,
                 phaseFrames = result.phases.associate { phase -> phase.name to phase.frameIndex.toString() },
+                replayState = ReplayState.NotLoaded,
                 isBusy = false,
+                isGeneratingAi = false,
                 error = null,
                 message = null,
             )
         }
+        resolveReplay(result)
     }
 
     fun submitAnalysis() {
@@ -146,6 +163,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun openHistoryResult(runId: String) {
+        viewModelScope.launch {
+            runCatching {
+                _uiState.update { it.copy(screen = Screen.History, isBusy = true, error = null, message = null) }
+                repository.getAnalysis(runId)
+            }.onSuccess { result ->
+                showResult(result)
+            }.onFailure { throwable ->
+                _uiState.update {
+                    it.copy(
+                        screen = Screen.History,
+                        isBusy = false,
+                        error = throwable.message ?: "Unable to open analysis.",
+                    )
+                }
+            }
+        }
+    }
+
     fun openPhaseReview() {
         val result = _uiState.value.result ?: return
         _uiState.update {
@@ -181,6 +217,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         message = "Phase timing saved.",
                     )
                 }
+                viewModelScope.launch {
+                    repository.invalidateRunArtifacts(updated.runId)
+                    showResult(updated)
+                }
             }.onFailure { throwable ->
                 _uiState.update { it.copy(isBusy = false, error = throwable.message ?: "Unable to save phase timing.") }
             }
@@ -189,6 +229,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun generateAiAssessment() {
         val result = _uiState.value.result ?: return
+        if (_uiState.value.isGeneratingAi) return
         viewModelScope.launch {
             runCatching {
                 _uiState.update { it.copy(isGeneratingAi = true, error = null, message = "Generating AI assessment...") }
@@ -199,6 +240,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         result = updated,
                         isGeneratingAi = false,
                         message = "AI assessment generated.",
+                        error = null,
                     )
                 }
             }.onFailure { throwable ->
@@ -206,6 +248,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(
                         isGeneratingAi = false,
                         error = throwable.message ?: "Unable to generate AI assessment.",
+                        message = null,
                     )
                 }
             }
@@ -213,4 +256,84 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun artifactUrl(path: String?): String = repository.artifactUrl(path)
+
+    fun retryReplayDownload() {
+        val result = _uiState.value.result ?: return
+        resolveReplay(result, forceDownload = true)
+    }
+
+    fun clearDownloadedReplays() {
+        viewModelScope.launch {
+            runCatching {
+                _uiState.update { it.copy(isBusy = true, error = null, message = null) }
+                repository.clearDownloadedReplays(currentReplayUri())
+            }.onSuccess {
+                _uiState.update { state ->
+                    val current = state.replayState
+                    state.copy(
+                        isBusy = false,
+                        replayState = if (current is ReplayState.Ready) ReplayState.NotLoaded else current,
+                        message = "Downloaded replays cleared.",
+                    )
+                }
+            }.onFailure { throwable ->
+                _uiState.update {
+                    it.copy(
+                        isBusy = false,
+                        error = throwable.message ?: "Unable to clear downloaded replays.",
+                    )
+                }
+            }
+        }
+    }
+
+    private fun resolveReplay(result: AnalysisResultResponse, forceDownload: Boolean = false) {
+        val artifactPath = result.artifactUrls[ArtifactCache.ANNOTATED_VIDEO]
+        if (artifactPath.isNullOrBlank()) {
+            _uiState.update { it.copy(replayState = ReplayState.NotLoaded) }
+            return
+        }
+        replayJob?.cancel()
+        replayJob = viewModelScope.launch {
+            runCatching {
+                if (!forceDownload) {
+                    repository.cachedArtifact(
+                        runId = result.runId,
+                        artifactName = ArtifactCache.ANNOTATED_VIDEO,
+                        artifactPath = artifactPath,
+                    )?.let { return@runCatching it }
+                }
+                _uiState.update { it.copy(replayState = ReplayState.Downloading) }
+                repository.downloadArtifact(
+                    runId = result.runId,
+                    artifactName = ArtifactCache.ANNOTATED_VIDEO,
+                    artifactPath = artifactPath,
+                    protectedUri = currentReplayUri(),
+                )
+            }.onSuccess { uri ->
+                _uiState.update { state ->
+                    if (state.result?.runId == result.runId) {
+                        state.copy(replayState = ReplayState.Ready(uri))
+                    } else {
+                        state
+                    }
+                }
+            }.onFailure { throwable ->
+                _uiState.update { state ->
+                    if (state.result?.runId == result.runId) {
+                        state.copy(
+                            replayState = ReplayState.Failed(
+                                throwable.message ?: "Unable to download replay.",
+                            ),
+                        )
+                    } else {
+                        state
+                    }
+                }
+            }
+        }
+    }
+
+    private fun currentReplayUri(): String? =
+        (_uiState.value.replayState as? ReplayState.Ready)?.uri
 }

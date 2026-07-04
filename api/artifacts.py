@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from analysis.models import AnalysisResult
+from analysis.visualise import browser_playback_video
 
 
 STATIC_ARTIFACTS = {
@@ -17,6 +18,9 @@ STATIC_ARTIFACTS = {
 
 
 def artifact_path(result: AnalysisResult, artifact_name: str) -> Path | None:
+    if artifact_name == "annotated_video":
+        path = result.artifacts.annotated_video
+        return browser_playback_video(path) if path.exists() else None
     if artifact_name in STATIC_ARTIFACTS:
         path = getattr(result.artifacts, STATIC_ARTIFACTS[artifact_name])
         return path if path is not None and path.exists() else None
@@ -36,4 +40,3 @@ def _child_artifact(directory: Path, filename: str) -> Path | None:
     except (OSError, ValueError):
         return None
     return candidate if candidate.exists() and candidate.is_file() else None
-

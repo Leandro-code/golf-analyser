@@ -10,10 +10,13 @@ from fastapi.testclient import TestClient
 
 import api.main as api_main
 from analysis.assessment import assess_swing
+from analysis.llm_assessment import llm_assessment_fingerprint
 from analysis.models import (
     AnalysisArtifacts,
     AnalysisContext,
     AnalysisResult,
+    LLMAssessment,
+    LLMAssessmentContent,
     LandmarkFrame,
     MetricSet,
     MetricValue,
@@ -217,6 +220,39 @@ def test_llm_assessment_eligibility_failure_and_mocked_success(tmp_path, monkeyp
     monkeypatch.setattr(api_main, "generate_llm_assessment", fake_generate)
     success = client.post("/analyses/swing_llm/llm-assessment")
     assert success.status_code == 200
+
+
+def test_llm_assessment_returns_current_saved_result_without_regenerating(tmp_path, monkeypatch):
+    _configure_api(tmp_path, monkeypatch)
+    run_dir = _write_run(tmp_path / "swing_llm_current", context=_context())
+    result = api_main.load_analysis_result(run_dir)
+    assessment = LLMAssessment(
+        schema_version="1.0.0",
+        prompt_version="1.0.0",
+        model="test-model",
+        generated_at="2026-07-04T00:00:00+00:00",
+        context=_context(),
+        submitted_frames=[],
+        quality_snapshot={},
+        evidence_fingerprint=llm_assessment_fingerprint(result),
+        content=LLMAssessmentContent(overview="Saved assessment"),
+    )
+    (run_dir / "llm_assessment.json").write_text(
+        assessment.model_dump_json(),
+        encoding="utf-8",
+    )
+
+    def fail_generate(_result):
+        raise AssertionError("Should not regenerate a current saved assessment")
+
+    monkeypatch.setattr(api_main, "generate_llm_assessment", fail_generate)
+    client = TestClient(api_main.app)
+
+    response = client.post("/analyses/swing_llm_current/llm-assessment")
+
+    assert response.status_code == 200
+    assert response.json()["llm_assessment_current"] is True
+    assert response.json()["llm_assessment"]["content"]["overview"] == "Saved assessment"
 
 
 def _configure_api(tmp_path: Path, monkeypatch, token: str | None = None) -> None:
