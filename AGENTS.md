@@ -8,6 +8,7 @@ The system keeps phase timing, pose metrics, and quality gates deterministic and
 
 ## Environment And Commands
 
+- Default to running project commands through WSL from `/home/larranz/projects/golf-analyser`.
 - Use the project-local virtual environment at `.venv/` for all third-party Python packages.
 - Install dependencies with `.venv/bin/pip install -r requirements.txt`.
 - Run tests with `.venv/bin/python -m pytest`.

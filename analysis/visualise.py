@@ -30,6 +30,8 @@ POSE_CONNECTIONS = [
     ("nose", "right_shoulder"),
 ]
 
+MAX_PLAYBACK_DIMENSION = 1280
+
 
 def render_annotated_video(
     source_video: Path,
@@ -133,7 +135,12 @@ def browser_playback_video(video_path: Path) -> Path:
     """Return a browser-playable H.264 path without rewriting historical output."""
     video_path = Path(video_path)
     codec = _video_fourcc(video_path)
-    if codec in {"avc1", "H264", "h264"} or codec is None:
+    dimensions = _video_dimensions(video_path)
+    if (
+        codec in {"avc1", "H264", "h264"}
+        and dimensions is not None
+        and max(dimensions) <= MAX_PLAYBACK_DIMENSION
+    ) or codec is None:
         return video_path
     stat = video_path.stat()
     signature = f"{video_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
@@ -155,6 +162,20 @@ def _video_fourcc(video_path: Path) -> str | None:
     if not code:
         return None
     return "".join(chr((code >> (8 * index)) & 0xFF) for index in range(4))
+
+
+def _video_dimensions(video_path: Path) -> tuple[int, int] | None:
+    if not video_path.exists() or video_path.stat().st_size == 0:
+        return None
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
 
 
 def _transcode_h264(source_video: Path, target_video: Path) -> None:
@@ -180,7 +201,14 @@ def _transcode_h264(source_video: Path, target_video: Path) -> None:
                 "-preset",
                 "medium",
                 "-crf",
-                "20",
+                "23",
+                "-vf",
+                (
+                    f"scale=w='min({MAX_PLAYBACK_DIMENSION},iw)':"
+                    f"h='min({MAX_PLAYBACK_DIMENSION},ih)':"
+                    "force_original_aspect_ratio=decrease:"
+                    "force_divisible_by=2"
+                ),
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",

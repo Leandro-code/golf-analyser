@@ -72,6 +72,134 @@ Historical runs created before contextual feedback remain viewable, but do not r
 
 The project disables pytest output capture in `pytest.ini` because MediaPipe/OpenGL logging can break pytest's default capture backend in some WSL temp-directory setups.
 
+## Run the Dev Environment
+
+For Android/API development, start the backend and native Android client in
+separate terminals.
+
+Terminal 1, from the repo root:
+
+```bash
+cd /home/larranz/projects/golf-analyser
+.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The API loads `OPENAI_API_KEY` and `GOLF_ANALYSER_OPENAI_MODEL` from the
+repository `.env` file when it starts, so AI assessment requests remain
+server-side and no OpenAI key is exposed to Android.
+
+Check the API at <http://localhost:8000/health>.
+
+Terminal 2, open `android/` in Android Studio or run Gradle from that directory.
+The debug default points an emulator at `http://10.0.2.2:8000`. For a physical
+device, set the Android API base URL to the computer's LAN IP, for example
+`http://192.168.1.23:8000`, and allow inbound port `8000` through the firewall.
+
+## Run the API
+
+The FastAPI backend wraps the same `analysis/` pipeline and stores completed runs
+under `outputs/` by default. For local testing, start it from the repo root:
+
+```bash
+cd /home/larranz/projects/golf-analyser
+.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Check that it is running at <http://localhost:8000/health>.
+
+Set `GOLF_ANALYSER_API_TOKEN` to require `Authorization: Bearer <token>` on API
+routes except `/health`. Set `GOLF_ANALYSER_OUTPUTS_DIR` to point the API at a
+different local run directory.
+
+Implemented endpoints:
+
+```text
+GET  /health
+POST /analyses
+GET  /analyses
+GET  /analyses/{run_id}
+GET  /analyses/{run_id}/status
+GET  /analyses/{run_id}/artifacts/{artifact_name}
+POST /analyses/{run_id}/phases/redetect
+POST /analyses/{run_id}/phases/confirm
+POST /analyses/{run_id}/llm-assessment
+```
+
+Analysis jobs run asynchronously in a local in-process worker. Completed jobs are
+recoverable from saved `outputs/swing_*` directories.
+
+## Run the Native Android Client
+
+The Stage 1 Android client is in `android/` and uses Kotlin, Jetpack Compose,
+Material 3, Retrofit/OkHttp, and Media3. It talks to the FastAPI backend and
+keeps pose analysis, phase detection, replay rendering, persistence, and OpenAI
+calls on the Python side.
+
+From `android/`, build or run the app with Android Studio or Gradle:
+
+```bash
+cd /home/larranz/projects/golf-analyser/android
+./gradlew :app:assembleDebug
+```
+
+If the backend token is enabled, pass it to Gradle:
+
+```bash
+./gradlew :app:assembleDebug -PGOLF_ANALYSER_API_TOKEN=secret
+```
+
+The native app can choose/import a swing video, submit capture context, poll
+processing status, play the annotated replay, generate the AI assessment, reopen
+saved analyses, and confirm all nine phase markers.
+
+## Legacy Expo Client
+
+The older Expo/React Native client remains in `mobile/` as a prototype and web
+test harness. Install dependencies once before the first run:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+npm install
+```
+
+Start the mobile client with the API URL:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm start
+```
+
+For browser testing, start Expo in web mode:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+EXPO_PUBLIC_API_BASE_URL=http://localhost:8000 npm run start -- --web
+```
+
+Then open <http://localhost:8081>.
+
+If Expo reports missing web support, install the web dependencies once:
+
+```bash
+cd /home/larranz/projects/golf-analyser/mobile
+npx expo install react-native-web react-dom
+```
+
+For Expo Go on a physical phone, replace `localhost` with the computer's LAN IP,
+for example `EXPO_PUBLIC_API_BASE_URL=http://192.168.1.23:8000`. Start Uvicorn
+with `--host 0.0.0.0`, keep the phone and computer on the same Wi-Fi or hotspot,
+and allow inbound port `8000` through the computer firewall if needed.
+
+Set `EXPO_PUBLIC_API_TOKEN` when the backend token is enabled. The client can
+choose/import a swing video, submit capture context, poll processing status,
+show the annotated replay, generate AI coaching, reopen saved reports from
+history, and confirm all nine phase markers. A failed upload keeps the selected
+clip available for a session-level retry.
+
 ## Scope
 
-This milestone intentionally excludes club tracking, ball flight tracking, live camera capture, cloud deployment, authentication, custom ML models, scoring, pro comparison, and Android implementation. Optional AI swing assessment is limited to visible 2D still-image observations and local pose measurements.
+This milestone intentionally excludes on-device pose analysis, club tracking,
+ball flight tracking, live camera capture, cloud deployment, account
+authentication, custom ML models, scoring, and pro comparison. AI swing
+assessment is limited to visible 2D still-image observations and local pose
+measurements, and must be explicitly requested by the user.
