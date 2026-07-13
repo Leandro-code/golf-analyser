@@ -9,6 +9,7 @@ import com.golfanalyser.app.data.AnalysisResultResponse
 import com.golfanalyser.app.data.AnalysisStatusResponse
 import com.golfanalyser.app.data.ArtifactCache
 import com.golfanalyser.app.data.ContextPayload
+import com.golfanalyser.app.data.OpenAiSettings
 import com.golfanalyser.app.data.buildPhaseConfirmationPayload
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,6 +48,8 @@ data class AppUiState(
     val result: AnalysisResultResponse? = null,
     val history: List<AnalysisResultResponse> = emptyList(),
     val phaseFrames: Map<String, String> = emptyMap(),
+    val openAiApiKey: String = "",
+    val openAiModel: String = "",
     val replayState: ReplayState = ReplayState.NotLoaded,
     val isBusy: Boolean = false,
     val isGeneratingAi: Boolean = false,
@@ -60,14 +63,22 @@ enum class Screen {
     Result,
     History,
     PhaseReview,
+    Settings,
 }
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = AnalysisRepository(application.contentResolver, application.cacheDir)
+    private val repository = AnalysisRepository(application)
     private val _uiState = MutableStateFlow(AppUiState())
     val uiState: StateFlow<AppUiState> = _uiState
     private var pollingJob: Job? = null
     private var replayJob: Job? = null
+
+    init {
+        val openAi = repository.openAiSettings()
+        _uiState.update {
+            it.copy(openAiApiKey = openAi.apiKey, openAiModel = openAi.model)
+        }
+    }
 
     fun selectVideo(uri: Uri) {
         _uiState.update { it.copy(selectedVideo = uri, error = null, message = null) }
@@ -93,6 +104,37 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 message = null,
             )
         }
+    }
+
+    fun showSettings() {
+        val openAi = repository.openAiSettings()
+        _uiState.update {
+            it.copy(
+                screen = Screen.Settings,
+                openAiApiKey = openAi.apiKey,
+                openAiModel = openAi.model,
+                error = null,
+                message = null,
+            )
+        }
+    }
+
+    fun updateOpenAiApiKey(value: String) {
+        _uiState.update { it.copy(openAiApiKey = value) }
+    }
+
+    fun updateOpenAiModel(value: String) {
+        _uiState.update { it.copy(openAiModel = value) }
+    }
+
+    fun saveSettings() {
+        repository.saveOpenAiSettings(
+            OpenAiSettings(
+                apiKey = _uiState.value.openAiApiKey,
+                model = _uiState.value.openAiModel,
+            ),
+        )
+        _uiState.update { it.copy(message = "Settings saved.", error = null) }
     }
 
     fun showResult(result: AnalysisResultResponse) {

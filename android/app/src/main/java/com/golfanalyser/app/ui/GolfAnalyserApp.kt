@@ -5,6 +5,7 @@ import android.net.Uri
 import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -42,6 +43,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,6 +52,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -65,10 +68,13 @@ import androidx.media3.ui.PlayerView
 import com.golfanalyser.app.data.AnalysisResultResponse
 import com.golfanalyser.app.data.AssessmentFindingDto
 import com.golfanalyser.app.data.ContextPayload
+import com.golfanalyser.app.analysis.LandmarkFrame
+import com.golfanalyser.app.analysis.LandmarkPoint
 import com.golfanalyser.app.data.LlmAssessmentDto
 import com.golfanalyser.app.data.MetricDto
 import com.golfanalyser.app.data.SwingPhaseDto
 import com.golfanalyser.app.data.confidenceLabel
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
@@ -93,6 +99,7 @@ fun GolfAnalyserApp(viewModel: AppViewModel = viewModel()) {
                 Screen.Result -> ResultScreen(state, viewModel)
                 Screen.History -> HistoryScreen(state, viewModel)
                 Screen.PhaseReview -> PhaseReviewScreen(state, viewModel)
+                Screen.Settings -> SettingsScreen(state, viewModel)
             }
         }
     }
@@ -132,7 +139,10 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
     }
     AppScaffold(
         title = "New swing",
-        actions = { TextButton(onClick = viewModel::loadHistory) { Text("History") } },
+        actions = {
+            TextButton(onClick = viewModel::showSettings) { Text("Settings") }
+            TextButton(onClick = viewModel::loadHistory) { Text("History") }
+        },
     ) { padding ->
         LazyColumn(
             modifier = Modifier
@@ -249,6 +259,7 @@ private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
     AppScaffold(
         title = "Saved analyses",
         actions = {
+            TextButton(onClick = viewModel::showSettings) { Text("Settings") }
             TextButton(onClick = viewModel::clearDownloadedReplays) { Text("Clear replays") }
             TextButton(onClick = viewModel::showNewSwing) { Text("New") }
         },
@@ -282,6 +293,7 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
     AppScaffold(
         title = "Swing analysis",
         actions = {
+            TextButton(onClick = viewModel::showSettings) { Text("Settings") }
             TextButton(onClick = viewModel::loadHistory) { Text("History") }
             TextButton(onClick = viewModel::showNewSwing) { Text("New") }
         },
@@ -294,7 +306,7 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             item {
-                ReplayPanel(state.replayState, viewModel::retryReplayDownload)
+                ReplayPanel(state.replayState, result, viewModel::retryReplayDownload)
             }
             item {
                 ResultHeader(result)
@@ -325,7 +337,7 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
 }
 
 @Composable
-private fun ReplayPanel(replayState: ReplayState, onRetry: () -> Unit) {
+private fun ReplayPanel(replayState: ReplayState, result: AnalysisResultResponse, onRetry: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -362,7 +374,7 @@ private fun ReplayPanel(replayState: ReplayState, onRetry: () -> Unit) {
                     }
                 }
             }
-            is ReplayState.Ready -> VideoPlayer(replayState.uri)
+            is ReplayState.Ready -> VideoPlayer(replayState.uri, result)
         }
     }
 }
@@ -382,13 +394,20 @@ private fun ResultHeader(result: AnalysisResultResponse) {
 }
 
 @Composable
-private fun VideoPlayer(url: String) {
+private fun VideoPlayer(url: String, result: AnalysisResultResponse) {
     val context = LocalContext.current
     var videoAspectRatio by remember(url) { mutableStateOf(9f / 16f) }
+    var currentPositionMs by remember(url) { mutableStateOf(0L) }
     val player = remember(url) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(url))
             prepare()
+        }
+    }
+    LaunchedEffect(player) {
+        while (true) {
+            currentPositionMs = player.currentPosition
+            delay(80)
         }
     }
     DisposableEffect(player) {
@@ -406,27 +425,101 @@ private fun VideoPlayer(url: String) {
             player.release()
         }
     }
-    AndroidView(
+    Box(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(videoAspectRatio)
             .background(Color.Black),
-        factory = {
-            PlayerView(it).apply {
-                this.player = player
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
+    ) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = {
+                PlayerView(it).apply {
+                    this.player = player
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                }
+            },
+            update = {
+                it.player = player
+                it.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+            },
+        )
+        PoseOverlay(
+            result = result,
+            currentPositionMs = currentPositionMs,
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
+}
+
+@Composable
+private fun PoseOverlay(
+    result: AnalysisResultResponse,
+    currentPositionMs: Long,
+    modifier: Modifier = Modifier,
+) {
+    val fps = result.metadata?.get("fps")?.let { (it as? JsonPrimitive)?.doubleOrNull } ?: 30.0
+    val frameIndex = ((currentPositionMs / 1000.0) * fps).toInt()
+    val frame = result.landmarks.minByOrNull { kotlin.math.abs(it.frameIndex - frameIndex) }
+        ?.takeIf { it.poseDetected }
+    val phase = result.phases.minByOrNull { kotlin.math.abs(it.frameIndex - frameIndex) }
+    Canvas(modifier = modifier) {
+        if (frame == null) return@Canvas
+        val points = frame.landmarks.associateBy { it.name }
+        SKELETON_CONNECTIONS.forEach { (first, second) ->
+            val a = points[first]
+            val b = points[second]
+            if (a != null && b != null) {
+                drawLine(
+                    color = Color(0xFFE7F5E8),
+                    start = a.offset(size.width, size.height),
+                    end = b.offset(size.width, size.height),
+                    strokeWidth = 4f,
                 )
             }
-        },
-        update = {
-            it.player = player
-            it.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-        },
-    )
+        }
+        points.values.forEach { point ->
+            drawCircle(
+                color = Color(0xFF75D0A2),
+                radius = 5f,
+                center = point.offset(size.width, size.height),
+                style = Stroke(width = 2f),
+            )
+        }
+        phase?.takeIf { kotlin.math.abs(it.frameIndex - frame.frameIndex) <= maxOf(1, fps.toInt() / 12) }?.let {
+            drawCircle(
+                color = Color(0xFFFFD166),
+                radius = 14f,
+                center = points["left_wrist"]?.offset(size.width, size.height)
+                    ?: points["right_wrist"]?.offset(size.width, size.height)
+                    ?: return@let,
+                style = Stroke(width = 4f),
+            )
+        }
+    }
 }
+
+private fun LandmarkPoint.offset(width: Float, height: Float) =
+    androidx.compose.ui.geometry.Offset((x * width).toFloat(), (y * height).toFloat())
+
+private val SKELETON_CONNECTIONS = listOf(
+    "left_shoulder" to "right_shoulder",
+    "left_shoulder" to "left_elbow",
+    "left_elbow" to "left_wrist",
+    "right_shoulder" to "right_elbow",
+    "right_elbow" to "right_wrist",
+    "left_shoulder" to "left_hip",
+    "right_shoulder" to "right_hip",
+    "left_hip" to "right_hip",
+    "left_hip" to "left_knee",
+    "left_knee" to "left_ankle",
+    "right_hip" to "right_knee",
+    "right_knee" to "right_ankle",
+)
 
 @Composable
 private fun AiAssessmentCard(result: AnalysisResultResponse, isGenerating: Boolean, viewModel: AppViewModel) {
@@ -588,6 +681,44 @@ private fun PhaseReviewScreen(state: AppUiState, viewModel: AppViewModel) {
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(if (state.isBusy) "Saving..." else "Save phase timing")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsScreen(state: AppUiState, viewModel: AppViewModel) {
+    AppScaffold(
+        title = "Settings",
+        actions = { TextButton(onClick = viewModel::showNewSwing) { Text("Done") } },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text("AI provider", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            OutlinedTextField(
+                value = state.openAiApiKey,
+                onValueChange = viewModel::updateOpenAiApiKey,
+                label = { Text("OpenAI API key") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = state.openAiModel,
+                onValueChange = viewModel::updateOpenAiModel,
+                label = { Text("Model") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (state.message != null) InfoBanner(state.message)
+            if (state.error != null) ErrorBanner(state.error)
+            Button(onClick = viewModel::saveSettings, modifier = Modifier.fillMaxWidth()) {
+                Text("Save settings")
             }
         }
     }

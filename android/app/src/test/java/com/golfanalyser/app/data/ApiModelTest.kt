@@ -49,12 +49,35 @@ class ApiModelTest {
                 "prompt_version": "1.0.0",
                 "model": "test-model",
                 "generated_at": "2026-06-21T00:00:00Z",
+                "context": {
+                  "handedness": "right",
+                  "camera_view": "face_on",
+                  "club_family": "iron",
+                  "swing_type": "full_swing"
+                },
                 "submitted_frames": [],
+                "quality_snapshot": {
+                  "phase_scoped_metrics": true
+                },
+                "evidence_fingerprint": "abc123",
                 "content": {
                   "overview": "Grounded overview",
                   "strengths": [],
                   "observations": [],
-                  "priorities": [],
+                  "priorities": [
+                    {
+                      "title": "Keep posture stable",
+                      "rationale": "Supported by frame evidence.",
+                      "practice_cue": "Hold posture",
+                      "explanation": null,
+                      "drills": [],
+                      "practice_plan": [],
+                      "supporting_frame_ids": [],
+                      "related_metric_keys": [],
+                      "confidence": 0.7,
+                      "support_type": "ai_generated"
+                    }
+                  ],
                   "limitations": []
                 }
               },
@@ -72,6 +95,8 @@ class ApiModelTest {
         assertEquals("face_on", result.context?.cameraView)
         assertEquals("Address", result.phases.single().name)
         assertEquals("Grounded overview", result.llmAssessment?.content?.overview)
+        assertEquals("abc123", result.llmAssessment?.evidenceFingerprint)
+        assertEquals("ai_generated", result.llmAssessment?.content?.priorities?.single()?.supportType)
         assertTrue(result.llmAssessmentCurrent)
     }
 }

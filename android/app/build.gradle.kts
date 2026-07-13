@@ -1,8 +1,37 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) {
+        file.inputStream().use(::load)
+    }
+}
+
+val repoEnv = Properties().apply {
+    val file = rootProject.file("../.env")
+    if (file.exists()) {
+        file.readLines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") && "=" in it }
+            .forEach { line ->
+                val key = line.substringBefore("=").trim()
+                val value = line.substringAfter("=").trim()
+                setProperty(key, value)
+            }
+    }
+}
+
+fun localStringProperty(name: String): String =
+    providers.gradleProperty(name).orNull
+        ?: localProperties.getProperty(name)
+        ?: repoEnv.getProperty(name)
+        ?: ""
 
 android {
     namespace = "com.golfanalyser.app"
@@ -18,14 +47,22 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField(
             "String",
-            "DEFAULT_API_BASE_URL",
-            "\"http://10.0.2.2:8000\"",
+            "DEFAULT_OPENAI_MODEL",
+            "\"${localStringProperty("GOLF_ANALYSER_OPENAI_MODEL").ifBlank { "gpt-5.5" }}\"",
         )
-        buildConfigField(
-            "String",
-            "API_TOKEN",
-            "\"${providers.gradleProperty("GOLF_ANALYSER_API_TOKEN").orNull.orEmpty()}\"",
-        )
+    }
+
+    buildTypes {
+        debug {
+            buildConfigField(
+                "String",
+                "DEBUG_OPENAI_API_KEY",
+                "\"${localStringProperty("OPENAI_API_KEY")}\"",
+            )
+        }
+        release {
+            buildConfigField("String", "DEBUG_OPENAI_API_KEY", "\"\"")
+        }
     }
 
     buildFeatures {
@@ -56,11 +93,11 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
     implementation("androidx.navigation:navigation-compose:2.7.7")
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("androidx.media3:media3-exoplayer:1.4.0")
     implementation("androidx.media3:media3-ui:1.4.0")
-    implementation("com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter:1.0.0")
-    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
-    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.google.mediapipe:tasks-vision:0.10.33")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 

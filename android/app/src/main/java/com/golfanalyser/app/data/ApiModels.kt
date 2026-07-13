@@ -1,5 +1,6 @@
 package com.golfanalyser.app.data
 
+import com.golfanalyser.app.analysis.LandmarkFrame
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -104,6 +105,7 @@ data class LlmPriorityDto(
     @SerialName("supporting_frame_ids") val supportingFrameIds: List<String> = emptyList(),
     @SerialName("related_metric_keys") val relatedMetricKeys: List<String> = emptyList(),
     val confidence: Double,
+    @SerialName("support_type") val supportType: String = "ai_generated",
 )
 
 @Serializable
@@ -121,7 +123,10 @@ data class LlmAssessmentDto(
     @SerialName("prompt_version") val promptVersion: String,
     val model: String,
     @SerialName("generated_at") val generatedAt: String,
+    val context: ContextPayload? = null,
     @SerialName("submitted_frames") val submittedFrames: List<SubmittedEvidenceFrameDto> = emptyList(),
+    @SerialName("quality_snapshot") val qualitySnapshot: Map<String, JsonElement> = emptyMap(),
+    @SerialName("evidence_fingerprint") val evidenceFingerprint: String? = null,
     val content: LlmContentDto,
 )
 
@@ -131,6 +136,7 @@ data class AnalysisResultResponse(
     val status: String = "completed",
     val context: ContextPayload? = null,
     val metadata: Map<String, JsonElement>? = null,
+    val landmarks: List<LandmarkFrame> = emptyList(),
     val phases: List<SwingPhaseDto> = emptyList(),
     @SerialName("metrics_summary") val metricsSummary: Map<String, MetricDto> = emptyMap(),
     @SerialName("quality_flags") val qualityFlags: Map<String, JsonElement> = emptyMap(),

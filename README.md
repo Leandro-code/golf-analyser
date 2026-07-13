@@ -1,6 +1,9 @@
 # Golf Swing Analysis Workbench
 
-A local-first Python workbench for validating a golf swing analysis pipeline. It uploads a swing video, extracts MediaPipe pose landmarks, detects coarse swing phases, calculates deterministic metrics, renders an annotated replay, and writes JSON artifacts for future API or Android integration.
+A local-first golf swing analysis workbench. The Python/Streamlit app validates
+the analysis pipeline, and the native Android app now runs the core swing
+analysis on device with MediaPipe pose landmarks, deterministic phase detection,
+pose metrics, local run history, and optional direct OpenAI assessment.
 
 ## Setup
 
@@ -72,10 +75,49 @@ Historical runs created before contextual feedback remain viewable, but do not r
 
 The project disables pytest output capture in `pytest.ini` because MediaPipe/OpenGL logging can break pytest's default capture backend in some WSL temp-directory setups.
 
-## Run the Dev Environment
+## Branch Strategy
 
-For Android/API development, start the backend and native Android client in
-separate terminals.
+This branch is the Android local-first track. The hosted FastAPI/Streamlit
+implementation remains recoverable on:
+
+```text
+branch: hosted-api
+tag:    hosted-api-baseline-2026-07-13
+```
+
+Use those references if you need to return to the hosted application design.
+
+## Run the Native Android App
+
+The native Android app in `android/` now performs swing analysis on device. It
+uses Kotlin, Jetpack Compose, Material 3, Media3, MediaPipe Tasks Vision, local
+app-private run storage, and direct OpenAI Responses API requests when an API
+key is configured in Settings.
+
+For debug testing, the build reads the default OpenAI key from Gradle
+properties, `android/local.properties`, or the repo `.env` file. You may place
+Android-specific values in untracked `android/local.properties`:
+
+```properties
+OPENAI_API_KEY=your_test_key
+GOLF_ANALYSER_OPENAI_MODEL=gpt-5.5
+```
+
+Release builds default to no API key; users can enter their own key in the app.
+
+Build or run the app with Android Studio, or run Gradle from `android/`:
+
+```bash
+cd /home/larranz/projects/golf-analyser/android
+./gradlew :app:testDebugUnitTest :app:assembleDebug
+```
+
+## Hosted Dev Environment
+
+The hosted API and Streamlit workflow are retained for fallback and comparison.
+Use the `hosted-api` branch when you want that version as the active app design.
+From this branch, the Python API can still be run locally for compatibility
+testing.
 
 Terminal 1, from the repo root:
 
@@ -85,15 +127,9 @@ cd /home/larranz/projects/golf-analyser
 ```
 
 The API loads `OPENAI_API_KEY` and `GOLF_ANALYSER_OPENAI_MODEL` from the
-repository `.env` file when it starts, so AI assessment requests remain
-server-side and no OpenAI key is exposed to Android.
+repository `.env` file when it starts.
 
 Check the API at <http://localhost:8000/health>.
-
-Terminal 2, open `android/` in Android Studio or run Gradle from that directory.
-The debug default points an emulator at `http://10.0.2.2:8000`. For a physical
-device, set the Android API base URL to the computer's LAN IP, for example
-`http://192.168.1.23:8000`, and allow inbound port `8000` through the firewall.
 
 ## Run the API
 
@@ -127,30 +163,6 @@ POST /analyses/{run_id}/llm-assessment
 
 Analysis jobs run asynchronously in a local in-process worker. Completed jobs are
 recoverable from saved `outputs/swing_*` directories.
-
-## Run the Native Android Client
-
-The Stage 1 Android client is in `android/` and uses Kotlin, Jetpack Compose,
-Material 3, Retrofit/OkHttp, and Media3. It talks to the FastAPI backend and
-keeps pose analysis, phase detection, replay rendering, persistence, and OpenAI
-calls on the Python side.
-
-From `android/`, build or run the app with Android Studio or Gradle:
-
-```bash
-cd /home/larranz/projects/golf-analyser/android
-./gradlew :app:assembleDebug
-```
-
-If the backend token is enabled, pass it to Gradle:
-
-```bash
-./gradlew :app:assembleDebug -PGOLF_ANALYSER_API_TOKEN=secret
-```
-
-The native app can choose/import a swing video, submit capture context, poll
-processing status, play the annotated replay, generate the AI assessment, reopen
-saved analyses, and confirm all nine phase markers.
 
 ## Legacy Expo Client
 
@@ -198,8 +210,8 @@ clip available for a session-level retry.
 
 ## Scope
 
-This milestone intentionally excludes on-device pose analysis, club tracking,
-ball flight tracking, live camera capture, cloud deployment, account
-authentication, custom ML models, scoring, and pro comparison. AI swing
-assessment is limited to visible 2D still-image observations and local pose
-measurements, and must be explicitly requested by the user.
+This milestone intentionally excludes club tracking, ball flight tracking, live
+camera capture, cloud deployment, account authentication, custom ML models,
+scoring, and pro comparison. AI swing assessment is limited to visible 2D
+still-image observations and local pose measurements, and must be explicitly
+requested by the user.
