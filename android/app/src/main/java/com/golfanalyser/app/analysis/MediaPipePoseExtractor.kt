@@ -8,10 +8,15 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import java.io.File
+import kotlin.math.max
 import kotlin.math.roundToLong
 
 class MediaPipePoseExtractor(private val context: Context) {
-    fun extract(videoFile: File, metadata: VideoMetadata): List<LandmarkFrame> {
+    fun extract(
+        videoFile: File,
+        metadata: VideoMetadata,
+        onProgress: (processedFrames: Int, totalFrames: Int) -> Unit = { _, _ -> },
+    ): List<LandmarkFrame> {
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath(MODEL_ASSET)
             .build()
@@ -28,17 +33,24 @@ class MediaPipePoseExtractor(private val context: Context) {
             val retriever = MediaMetadataRetriever()
             try {
                 retriever.setDataSource(videoFile.absolutePath)
-                return (0 until metadata.frameCount.coerceAtLeast(1)).map { index ->
+                val totalFrames = metadata.frameCount.coerceAtLeast(1)
+                val progressInterval = max(1, totalFrames / 100)
+                return (0 until totalFrames).map { index ->
                     val timestampSeconds = index / metadata.fps.coerceAtLeast(1e-9)
                     val bitmap = retriever.getFrameAtTime(
                         (timestampSeconds * 1_000_000).roundToLong(),
                         MediaMetadataRetriever.OPTION_CLOSEST,
                     )
-                    if (bitmap == null) {
+                    val frame = if (bitmap == null) {
                         LandmarkFrame(index, timestampSeconds, poseDetected = false)
                     } else {
                         detectFrame(landmarker, bitmap, index, timestampSeconds)
                     }
+                    val processedFrames = index + 1
+                    if (processedFrames == 1 || processedFrames == totalFrames || processedFrames % progressInterval == 0) {
+                        onProgress(processedFrames, totalFrames)
+                    }
+                    frame
                 }
             } finally {
                 retriever.release()

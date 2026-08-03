@@ -9,8 +9,10 @@ import com.golfanalyser.app.data.AnalysisResultResponse
 import com.golfanalyser.app.data.AnalysisStatusResponse
 import com.golfanalyser.app.data.ArtifactCache
 import com.golfanalyser.app.data.ContextPayload
+import com.golfanalyser.app.data.LlmContentDraft
 import com.golfanalyser.app.data.OpenAiSettings
 import com.golfanalyser.app.data.buildPhaseConfirmationPayload
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -53,6 +55,7 @@ data class AppUiState(
     val replayState: ReplayState = ReplayState.NotLoaded,
     val isBusy: Boolean = false,
     val isGeneratingAi: Boolean = false,
+    val aiAssessmentDraft: LlmContentDraft? = null,
     val message: String? = null,
     val error: String? = null,
 )
@@ -72,6 +75,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<AppUiState> = _uiState
     private var pollingJob: Job? = null
     private var replayJob: Job? = null
+    private var aiGenerationJob: Job? = null
 
     init {
         val openAi = repository.openAiSettings()
@@ -91,6 +95,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun showNewSwing() {
         pollingJob?.cancel()
         replayJob?.cancel()
+        cancelAiGeneration()
         _uiState.update {
             it.copy(
                 screen = Screen.NewSwing,
@@ -100,6 +105,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 replayState = ReplayState.NotLoaded,
                 isBusy = false,
                 isGeneratingAi = false,
+                aiAssessmentDraft = null,
                 error = null,
                 message = null,
             )
@@ -107,6 +113,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun showSettings() {
+        cancelAiGeneration()
         val openAi = repository.openAiSettings()
         _uiState.update {
             it.copy(
@@ -139,6 +146,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun showResult(result: AnalysisResultResponse) {
         replayJob?.cancel()
+        cancelAiGeneration()
         _uiState.update {
             it.copy(
                 screen = Screen.Result,
@@ -147,6 +155,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 replayState = ReplayState.NotLoaded,
                 isBusy = false,
                 isGeneratingAi = false,
+                aiAssessmentDraft = null,
                 error = null,
                 message = null,
             )
@@ -163,15 +172,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         pollingJob?.cancel()
         pollingJob = viewModelScope.launch {
             runCatching {
-                _uiState.update { it.copy(isBusy = true, error = null, message = "Uploading video...") }
-                val created = repository.createAnalysis(video, _uiState.value.context)
                 _uiState.update {
                     it.copy(
                         screen = Screen.Processing,
-                        status = created.status,
-                        isBusy = false,
-                        message = created.status.message,
+                        status = null,
+                        isBusy = true,
+                        error = null,
+                        message = "Preparing selected video",
                     )
+                }
+                val created = repository.createAnalysis(video, _uiState.value.context) { status ->
+                    _uiState.update {
+                        it.copy(status = status, message = status.message, screen = Screen.Processing)
+                    }
                 }
                 repository.pollUntilComplete(created.runId) { status ->
                     _uiState.update {
@@ -193,6 +206,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadHistory() {
+        cancelAiGeneration()
         viewModelScope.launch {
             runCatching {
                 _uiState.update { it.copy(screen = Screen.History, isBusy = true, error = null) }
@@ -225,6 +239,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openPhaseReview() {
+        cancelAiGeneration()
         val result = _uiState.value.result ?: return
         _uiState.update {
             it.copy(
@@ -243,6 +258,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun savePhaseFrames() {
+        cancelAiGeneration()
         val result = _uiState.value.result ?: return
         viewModelScope.launch {
             runCatching {
@@ -270,29 +286,82 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun generateAiAssessment() {
+        startAiAssessment(force = false)
+    }
+
+    fun regenerateAiAssessment() {
+        startAiAssessment(force = true)
+    }
+
+    private fun startAiAssessment(force: Boolean) {
         val result = _uiState.value.result ?: return
         if (_uiState.value.isGeneratingAi) return
-        viewModelScope.launch {
-            runCatching {
-                _uiState.update { it.copy(isGeneratingAi = true, error = null, message = "Generating AI assessment...") }
-                repository.createLlmAssessment(result.runId)
-            }.onSuccess { updated ->
+        val runId = result.runId
+        val action = if (force) "Regenerating" else "Generating"
+        val completedAction = if (force) "regenerated" else "generated"
+        aiGenerationJob = viewModelScope.launch {
+            try {
                 _uiState.update {
                     it.copy(
-                        result = updated,
-                        isGeneratingAi = false,
-                        message = "AI assessment generated.",
+                        isGeneratingAi = true,
+                        aiAssessmentDraft = null,
                         error = null,
+                        message = "$action AI assessment...",
                     )
                 }
-            }.onFailure { throwable ->
+                val updated = repository.createLlmAssessment(runId, force = force) { draft ->
+                    _uiState.update { state ->
+                        if (state.result?.runId == runId && state.isGeneratingAi) {
+                            state.copy(aiAssessmentDraft = draft)
+                        } else {
+                            state
+                        }
+                    }
+                }
                 _uiState.update {
-                    it.copy(
-                        isGeneratingAi = false,
-                        error = throwable.message ?: "Unable to generate AI assessment.",
-                        message = null,
-                    )
+                    if (it.result?.runId == runId) {
+                        it.copy(
+                            result = updated,
+                            isGeneratingAi = false,
+                            aiAssessmentDraft = null,
+                            message = "AI assessment $completedAction.",
+                            error = null,
+                        )
+                    } else {
+                        it
+                    }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (throwable: Throwable) {
+                _uiState.update {
+                    if (it.result?.runId == runId) {
+                        it.copy(
+                            isGeneratingAi = false,
+                            aiAssessmentDraft = null,
+                            error = throwable.message ?: "Unable to generate AI assessment.",
+                            message = null,
+                        )
+                    } else {
+                        it
+                    }
+                }
+            } finally {
+                if (aiGenerationJob == kotlinx.coroutines.currentCoroutineContext()[Job]) {
+                    aiGenerationJob = null
+                }
+            }
+        }
+    }
+
+    private fun cancelAiGeneration() {
+        aiGenerationJob?.cancel()
+        aiGenerationJob = null
+        _uiState.update {
+            if (it.isGeneratingAi || it.aiAssessmentDraft != null) {
+                it.copy(isGeneratingAi = false, aiAssessmentDraft = null)
+            } else {
+                it
             }
         }
     }

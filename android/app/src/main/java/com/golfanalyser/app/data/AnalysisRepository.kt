@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.util.Base64
 import com.golfanalyser.app.analysis.AnalysisContext
 import com.golfanalyser.app.analysis.LandmarkFrame
@@ -40,44 +41,80 @@ private val json = Json {
     prettyPrint = true
 }
 
+internal fun isUsableEvidenceJpeg(bytes: ByteArray): Boolean =
+    bytes.size >= 4 &&
+        bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() &&
+        bytes[bytes.lastIndex - 1] == 0xFF.toByte() && bytes[bytes.lastIndex] == 0xD9.toByte()
+
 class AnalysisRepository(
     appContext: Context,
+    private val openAiClient: OpenAiAssessmentClient = OpenAiAssessmentClient(),
 ) {
     private val contentResolver = appContext.contentResolver
     private val rootDir = File(appContext.filesDir, "analyses").apply { mkdirs() }
     private val settings = AppSettings(appContext)
     private val poseExtractor = MediaPipePoseExtractor(appContext)
-    private val openAiClient = OpenAiAssessmentClient()
 
-    suspend fun createAnalysis(videoUri: Uri, context: ContextPayload): AnalysisCreateResponse = withContext(Dispatchers.IO) {
+    suspend fun createAnalysis(
+        videoUri: Uri,
+        context: ContextPayload,
+        onStatus: (AnalysisStatusResponse) -> Unit = {},
+    ): AnalysisCreateResponse = withContext(Dispatchers.IO) {
         val runId = newRunId()
         val runDir = File(rootDir, runId).apply { mkdirs() }
         val original = File(runDir, "original.mp4")
-        contentResolver.openInputStream(videoUri)?.use { input ->
-            original.outputStream().use { output -> input.copyTo(output) }
-        } ?: error("Unable to open selected video.")
+        val createdAt = nowIso()
+        var latestProgress = 0.0
 
-        val status = AnalysisStatusResponse(
-            runId = runId,
-            status = "processing",
-            progress = 0.2,
-            message = "Analysing on device",
-            createdAt = nowIso(),
-            updatedAt = nowIso(),
-        )
-        writeStatus(runDir, status)
-        val result = analyseLocal(runId, runDir, original, context)
-        writeResult(runDir, result)
-        writeStatus(
-            runDir,
-            status.copy(status = "completed", progress = 1.0, message = "Complete", updatedAt = nowIso()),
-        )
-        AnalysisCreateResponse(
-            runId = runId,
-            statusUrl = localStatusPath(runId),
-            resultUrl = localResultPath(runId),
-            status = status,
-        )
+        fun reportStatus(
+            progress: Double,
+            message: String,
+            status: String = "processing",
+            error: String? = null,
+        ): AnalysisStatusResponse {
+            latestProgress = progress
+            val update = AnalysisStatusResponse(
+                runId = runId,
+                status = status,
+                progress = progress,
+                message = message,
+                error = error,
+                createdAt = createdAt,
+                updatedAt = nowIso(),
+            )
+            writeStatus(runDir, update)
+            onStatus(update)
+            return update
+        }
+
+        reportStatus(0.02, "Preparing selected video")
+        try {
+            contentResolver.openInputStream(videoUri)?.use { input ->
+                original.outputStream().use { output -> input.copyTo(output) }
+            } ?: error("Unable to open selected video.")
+
+            reportStatus(0.08, "Reading video details")
+            val result = analyseLocal(runId, runDir, original, context) { progress, message ->
+                reportStatus(progress, message)
+            }
+            reportStatus(0.96, "Saving analysis")
+            writeResult(runDir, result)
+            val completed = reportStatus(1.0, "Complete", status = "completed")
+            AnalysisCreateResponse(
+                runId = runId,
+                statusUrl = localStatusPath(runId),
+                resultUrl = localResultPath(runId),
+                status = completed,
+            )
+        } catch (throwable: Throwable) {
+            reportStatus(
+                progress = latestProgress,
+                message = throwable.message ?: "Analysis failed.",
+                status = "failed",
+                error = throwable.message ?: "Analysis failed.",
+            )
+            throw throwable
+        }
     }
 
     suspend fun listAnalyses(): List<AnalysisResultResponse> = withContext(Dispatchers.IO) {
@@ -113,10 +150,14 @@ class AnalysisRepository(
         updated
     }
 
-    suspend fun createLlmAssessment(runId: String): AnalysisResultResponse = withContext(Dispatchers.IO) {
+    suspend fun createLlmAssessment(
+        runId: String,
+        force: Boolean = false,
+        onDraft: (LlmContentDraft) -> Unit = {},
+    ): AnalysisResultResponse = withContext(Dispatchers.IO) {
         val runDir = runDir(runId)
         val current = currentResult(readResult(runDir))
-        current.llmAssessment?.takeIf { current.llmAssessmentCurrent }?.let {
+        current.llmAssessment?.takeIf { current.llmAssessmentCurrent && !force }?.let {
             return@withContext current
         }
         current.llmAssessmentEligibilityIssue?.let { error(it) }
@@ -127,7 +168,7 @@ class AnalysisRepository(
         val submittedFrames = selectEvidenceFrames(current)
         val exportedFrames = exportEvidenceFrames(runDir, current, submittedFrames)
         val assessmentPayload = assessmentPayload(current, submittedFrames)
-        val content = openAiClient.generate(openAi, assessmentPayload, exportedFrames)
+        val content = openAiClient.generate(openAi, assessmentPayload, exportedFrames, onDraft)
         validateFrameReferences(content, submittedFrames)
         val fingerprint = evidenceFingerprint(current, submittedFrames)
         val assessment = LlmAssessmentDto(
@@ -198,11 +239,21 @@ class AnalysisRepository(
         runDir: File,
         original: File,
         context: ContextPayload,
+        onProgress: (progress: Double, message: String) -> Unit,
     ): AnalysisResultResponse {
         val metadata = readVideoMetadata(original)
-        val landmarks = extractLandmarks(metadata)
+        onProgress(0.1, "Starting pose detection")
+        val landmarks = extractLandmarks(metadata) { processedFrames, totalFrames ->
+            val frameProgress = processedFrames.toDouble() / totalFrames
+            onProgress(
+                0.1 + (frameProgress * 0.78),
+                "Detecting pose: $processedFrames of $totalFrames frames",
+            )
+        }
+        onProgress(0.9, "Detecting swing phases")
         writeLandmarks(runDir, landmarks)
         val phases = SwingPhases.detect(landmarks, metadata.fps)
+        onProgress(0.93, "Calculating swing metrics")
         val metrics = SwingMetrics.calculate(landmarks, phases, context.toAnalysisContext())
         return AnalysisResultResponse(
             runId = runId,
@@ -230,9 +281,12 @@ class AnalysisRepository(
         )
     }
 
-    private fun extractLandmarks(metadata: VideoMetadata): List<LandmarkFrame> {
+    private fun extractLandmarks(
+        metadata: VideoMetadata,
+        onProgress: (processedFrames: Int, totalFrames: Int) -> Unit,
+    ): List<LandmarkFrame> {
         val file = File(metadata.sourcePath)
-        return poseExtractor.extract(file, metadata)
+        return poseExtractor.extract(file, metadata, onProgress)
     }
 
     private fun readVideoMetadata(file: File): VideoMetadata {
@@ -412,29 +466,101 @@ class AnalysisRepository(
         submittedFrames: List<SubmittedEvidenceFrameDto>,
     ): List<ExportedEvidenceFrame> {
         val original = File(Uri.parse(result.artifactUrls.getValue("original_video")).path.orEmpty())
-        val evidenceDir = File(runDir, "llm_frames").apply {
-            mkdirs()
-            listFiles { file -> file.name.startsWith("frame_") && file.extension == "jpg" }
-                ?.forEach { it.delete() }
-        }
-        val retriever = MediaMetadataRetriever()
-        try {
-            retriever.setDataSource(original.absolutePath)
-            return submittedFrames.map { evidenceFrame ->
-                val bitmap = retriever.getFrameAtTime(
-                    (evidenceFrame.timestampSeconds * 1_000_000).roundToLong(),
-                    MediaMetadataRetriever.OPTION_CLOSEST,
-                ) ?: error("Unable to export AI evidence frame ${evidenceFrame.frameIndex}.")
-                val jpeg = ByteArrayOutputStream().use { output ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)
-                    output.toByteArray()
-                }
-                File(evidenceDir, evidenceFrame.imageFile).writeBytes(jpeg)
-                ExportedEvidenceFrame(
-                    frame = evidenceFrame,
-                    dataUrl = "data:image/jpeg;base64," + Base64.encodeToString(jpeg, Base64.NO_WRAP),
-                )
+        require(original.isFile) { "The original replay required for AI assessment is unavailable." }
+        val evidenceDir = File(runDir, "llm_frames").apply { mkdirs() }
+        val preparedFrames = submittedFrames.map { evidenceFrame ->
+            val destination = File(evidenceDir, evidenceFrame.imageFile)
+            require(destination.parentFile == evidenceDir && destination.name == evidenceFrame.imageFile) {
+                "Invalid AI evidence image path."
             }
+            val cachedJpeg = runCatching { destination.readBytes() }
+                .getOrNull()
+                ?.takeIf(::isUsableEvidenceJpeg)
+            val jpeg = cachedJpeg ?: exportEvidenceJpeg(original, evidenceFrame)
+            Triple(evidenceFrame, destination, jpeg)
+        }
+
+        preparedFrames.forEach { (_, destination, jpeg) ->
+            val existing = runCatching { destination.readBytes() }.getOrNull()
+            if (existing == null || !existing.contentEquals(jpeg)) {
+                val staged = File(evidenceDir, "${destination.name}.pending")
+                staged.writeBytes(jpeg)
+                if (destination.exists() && !destination.delete()) {
+                    staged.delete()
+                    error("Unable to replace cached AI evidence ${destination.name}.")
+                }
+                if (!staged.renameTo(destination)) {
+                    staged.delete()
+                    error("Unable to save cached AI evidence ${destination.name}.")
+                }
+            }
+        }
+        val expectedNames = submittedFrames.mapTo(mutableSetOf()) { it.imageFile }
+        evidenceDir.listFiles { file -> file.name.startsWith("frame_") && file.extension == "jpg" }
+            ?.filterNot { it.name in expectedNames }
+            ?.forEach { it.delete() }
+
+        return preparedFrames.map { (evidenceFrame, _, jpeg) ->
+            ExportedEvidenceFrame(
+                frame = evidenceFrame,
+                dataUrl = "data:image/jpeg;base64," + Base64.encodeToString(jpeg, Base64.NO_WRAP),
+            )
+        }
+    }
+
+    private fun exportEvidenceJpeg(
+        original: File,
+        evidenceFrame: SubmittedEvidenceFrameDto,
+    ): ByteArray {
+        val bitmap = decodeEvidenceBitmap(original, evidenceFrame)
+            ?: error("Unable to export AI evidence frame ${evidenceFrame.frameIndex} after retrying the video decoder.")
+        return try {
+            ByteArrayOutputStream().use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)) {
+                    "Unable to encode AI evidence frame ${evidenceFrame.frameIndex}."
+                }
+                output.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun decodeEvidenceBitmap(
+        original: File,
+        evidenceFrame: SubmittedEvidenceFrameDto,
+    ): Bitmap? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            repeat(2) {
+                retrieveVideoBitmap(original) { retriever ->
+                    retriever.getFrameAtIndex(evidenceFrame.frameIndex)
+                }?.let { return it }
+            }
+        }
+
+        val targetUs = (evidenceFrame.timestampSeconds * 1_000_000).roundToLong()
+        val retryOffsetsUs = listOf(0L, 0L, -8_000L, 8_000L)
+        retryOffsetsUs.forEach { offsetUs ->
+            retrieveVideoBitmap(original) { retriever ->
+                retriever.getFrameAtTime(
+                    (targetUs + offsetUs).coerceAtLeast(0L),
+                    MediaMetadataRetriever.OPTION_CLOSEST,
+                )
+            }?.let { return it }
+        }
+        return null
+    }
+
+    private fun retrieveVideoBitmap(
+        original: File,
+        retrieve: (MediaMetadataRetriever) -> Bitmap?,
+    ): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(original.absolutePath)
+            retrieve(retriever)
+        } catch (_: RuntimeException) {
+            null
         } finally {
             retriever.release()
         }

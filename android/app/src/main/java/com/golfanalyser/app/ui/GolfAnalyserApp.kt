@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -55,6 +56,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -71,6 +73,7 @@ import com.golfanalyser.app.data.ContextPayload
 import com.golfanalyser.app.analysis.LandmarkFrame
 import com.golfanalyser.app.analysis.LandmarkPoint
 import com.golfanalyser.app.data.LlmAssessmentDto
+import com.golfanalyser.app.data.LlmContentDraft
 import com.golfanalyser.app.data.MetricDto
 import com.golfanalyser.app.data.SwingPhaseDto
 import com.golfanalyser.app.data.confidenceLabel
@@ -184,9 +187,13 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
                     enabled = !state.isBusy,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    if (state.isBusy) CircularProgressIndicator(modifier = Modifier.height(18.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (state.isBusy) "Uploading..." else "Analyse swing")
+                    if (state.isBusy) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Preparing...")
+                    } else {
+                        Text("Analyse swing")
+                    }
                 }
             }
         }
@@ -314,12 +321,19 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
             if (state.error != null) item { ErrorBanner(state.error) }
             if (state.message != null) item { InfoBanner(state.message) }
             item {
-                AiAssessmentCard(result, state.isGeneratingAi, viewModel)
+                AiAssessmentCard(result, state.isGeneratingAi, state.aiAssessmentDraft, viewModel)
             }
             item {
                 ActionRow(
                     onPhaseReview = viewModel::openPhaseReview,
-                    onGenerateAi = viewModel::generateAiAssessment,
+                    onGenerateAi = {
+                        if (result.llmAssessmentCurrent) {
+                            viewModel.regenerateAiAssessment()
+                        } else {
+                            viewModel.generateAiAssessment()
+                        }
+                    },
+                    aiButtonText = if (result.llmAssessmentCurrent) "Regenerate AI" else "AI assessment",
                     aiEnabled = result.llmAssessmentEligibilityIssue == null && !state.isGeneratingAi,
                 )
             }
@@ -522,12 +536,18 @@ private val SKELETON_CONNECTIONS = listOf(
 )
 
 @Composable
-private fun AiAssessmentCard(result: AnalysisResultResponse, isGenerating: Boolean, viewModel: AppViewModel) {
+private fun AiAssessmentCard(
+    result: AnalysisResultResponse,
+    isGenerating: Boolean,
+    draft: LlmContentDraft?,
+    viewModel: AppViewModel,
+) {
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("AI Swing Assessment", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             val assessment = if (result.llmAssessmentCurrent) result.llmAssessment else null
             when {
+                isGenerating -> AiAssessmentLoading(draft, assessment)
                 result.llmAssessmentStale -> WarningBanner("Saved AI assessment is stale. Regenerate after reviewing timing.")
                 result.llmAssessmentEligibilityIssue != null -> {
                     WarningBanner(result.llmAssessmentEligibilityIssue)
@@ -536,16 +556,12 @@ private fun AiAssessmentCard(result: AnalysisResultResponse, isGenerating: Boole
                     }
                 }
                 assessment == null -> {
-                    if (isGenerating) {
-                        AiAssessmentLoading()
-                    } else {
-                        Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
-                        Button(
-                            onClick = viewModel::generateAiAssessment,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("Generate AI assessment")
-                        }
+                    Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
+                    Button(
+                        onClick = viewModel::generateAiAssessment,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Generate AI assessment")
                     }
                 }
                 else -> LlmAssessmentContent(assessment)
@@ -555,7 +571,7 @@ private fun AiAssessmentCard(result: AnalysisResultResponse, isGenerating: Boole
 }
 
 @Composable
-private fun AiAssessmentLoading() {
+private fun AiAssessmentLoading(draft: LlmContentDraft?, previousAssessment: LlmAssessmentDto?) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -568,12 +584,54 @@ private fun AiAssessmentLoading() {
                 strokeWidth = 3.dp,
             )
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Generating AI assessment", fontWeight = FontWeight.Bold)
-                Text("Preparing swing evidence and waiting for the model response.")
+                Text(
+                    if (previousAssessment == null) "Generating AI assessment" else "Regenerating AI assessment",
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    if (draft?.hasVisibleContent == true) {
+                        "The report below is still being generated."
+                    } else {
+                        "Preparing swing evidence and waiting for the model response."
+                    },
+                )
             }
         }
         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        Text("This can take about a minute for the first request.")
+        if (draft?.hasVisibleContent == true) {
+            LlmAssessmentDraftContent(draft)
+        } else if (previousAssessment != null) {
+            Text("The current assessment will remain saved until its replacement is ready.")
+            LlmAssessmentContent(previousAssessment)
+        } else {
+            Text("This can take about a minute for the first request.")
+        }
+    }
+}
+
+@Composable
+private fun LlmAssessmentDraftContent(draft: LlmContentDraft) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (draft.overview.isNotBlank()) Text(draft.overview)
+        draft.priorities.forEachIndexed { index, priority ->
+            if (
+                priority.title.isNotBlank() || priority.rationale.isNotBlank() ||
+                priority.practiceCue.isNotBlank() || priority.drills.isNotEmpty() ||
+                priority.practicePlan.isNotEmpty()
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (priority.title.isNotBlank()) {
+                        Text("${index + 1}. ${priority.title}", fontWeight = FontWeight.Bold)
+                    }
+                    if (priority.rationale.isNotBlank()) Text(priority.rationale)
+                    if (priority.practiceCue.isNotBlank()) InfoBanner("Practice cue: ${priority.practiceCue}")
+                    AssessmentBulletList("Drills", priority.drills)
+                    AssessmentBulletList("Plan", priority.practicePlan)
+                }
+            }
+        }
+        AssessmentBulletList("Strengths", draft.strengths)
+        AssessmentBulletList("Limitations", draft.limitations)
     }
 }
 
@@ -586,29 +644,48 @@ private fun LlmAssessmentContent(assessment: LlmAssessmentDto) {
                 Text("${index + 1}. ${priority.title} (${confidenceLabel(priority.confidence)})", fontWeight = FontWeight.Bold)
                 Text(priority.rationale)
                 InfoBanner("Practice cue: ${priority.practiceCue}")
-                if (priority.drills.isNotEmpty()) Text("Drills: ${priority.drills.joinToString("; ")}")
-                if (priority.practicePlan.isNotEmpty()) Text("Plan: ${priority.practicePlan.joinToString("; ")}")
+                AssessmentBulletList("Drills", priority.drills)
+                AssessmentBulletList("Plan", priority.practicePlan)
             }
         }
-        if (assessment.content.strengths.isNotEmpty()) {
-            Text("Strengths", fontWeight = FontWeight.Bold)
-            assessment.content.strengths.forEach { Text("• $it") }
-        }
-        if (assessment.content.limitations.isNotEmpty()) {
-            Text("Limitations", fontWeight = FontWeight.Bold)
-            assessment.content.limitations.forEach { Text("• $it") }
+        AssessmentBulletList("Strengths", assessment.content.strengths)
+        AssessmentBulletList("Limitations", assessment.content.limitations)
+    }
+}
+
+@Composable
+private fun AssessmentBulletList(label: String, items: List<String>) {
+    val visibleItems = items.filter(String::isNotBlank)
+    if (visibleItems.isNotEmpty()) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(label, fontWeight = FontWeight.Bold)
+            visibleItems.forEach { item ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    Text("\u2022")
+                    Spacer(Modifier.width(8.dp))
+                    Text(item, modifier = Modifier.weight(1f))
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun ActionRow(onPhaseReview: () -> Unit, onGenerateAi: () -> Unit, aiEnabled: Boolean) {
+private fun ActionRow(
+    onPhaseReview: () -> Unit,
+    onGenerateAi: () -> Unit,
+    aiButtonText: String,
+    aiEnabled: Boolean,
+) {
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
         OutlinedButton(onClick = onPhaseReview, modifier = Modifier.weight(1f)) {
             Text("Review timing")
         }
         Button(onClick = onGenerateAi, enabled = aiEnabled, modifier = Modifier.weight(1f)) {
-            Text("AI assessment")
+            Text(aiButtonText)
         }
     }
 }
@@ -706,6 +783,7 @@ private fun SettingsScreen(state: AppUiState, viewModel: AppViewModel) {
                 onValueChange = viewModel::updateOpenAiApiKey,
                 label = { Text("OpenAI API key") },
                 singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(

@@ -2,8 +2,10 @@ package com.golfanalyser.app.data
 
 import java.io.IOException
 import java.util.concurrent.TimeUnit
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -17,9 +19,11 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 
 class OpenAiAssessmentClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
@@ -28,28 +32,58 @@ class OpenAiAssessmentClient(
         .writeTimeout(60, TimeUnit.SECONDS)
         .callTimeout(210, TimeUnit.SECONDS)
         .build(),
+    private val endpoint: HttpUrl = "https://api.openai.com/v1/responses".toHttpUrl(),
 ) {
-    fun generate(
+    suspend fun generate(
         settings: OpenAiSettings,
         payload: JsonObject,
         evidenceFrames: List<ExportedEvidenceFrame>,
-    ): LlmContentDto {
+        onDraft: (LlmContentDraft) -> Unit = {},
+    ): LlmContentDto = withContext(Dispatchers.IO) {
         val body = requestPayload(settings.model, payload, evidenceFrames).toString()
             .toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
-            .url("https://api.openai.com/v1/responses")
+            .url(endpoint)
             .header("Authorization", "Bearer ${settings.apiKey}")
             .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
             .post(body)
             .build()
-        httpClient.newCall(request).execute().use { response ->
-            val responseBody = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IOException("OpenAI swing assessment request failed: HTTP ${response.code} $responseBody")
+        val call = httpClient.newCall(request)
+        val cancellationHandle = currentCoroutineContext().job.invokeOnCompletion { cause ->
+            if (cause != null) call.cancel()
+        }
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    val responseBody = response.body?.string().orEmpty()
+                    throw IOException("OpenAI swing assessment request failed: HTTP ${response.code} $responseBody")
+                }
+                val responseBody = response.body
+                    ?: throw IOException("OpenAI swing assessment response was empty.")
+                val accumulator = ResponsesStreamAccumulator(onDraft)
+                val dataLines = mutableListOf<String>()
+                responseBody.source().use { source ->
+                    while (true) {
+                        val line = source.readUtf8Line() ?: break
+                        if (line.isEmpty()) {
+                            accumulator.acceptEvent(dataLines.joinToString("\n"))
+                            dataLines.clear()
+                        } else if (line.startsWith("data:")) {
+                            dataLines += line.removePrefix("data:").removePrefix(" ")
+                        }
+                    }
+                }
+                if (dataLines.isNotEmpty()) accumulator.acceptEvent(dataLines.joinToString("\n"))
+                val outputText = accumulator.finishedOutput()
+                return@withContext try {
+                    Json.decodeFromString<LlmContentDto>(outputText)
+                } catch (exc: Exception) {
+                    throw IOException("OpenAI returned an invalid structured swing assessment: ${exc.message}", exc)
+                }
             }
-            val text = extractOutputText(Json.parseToJsonElement(responseBody))
-                ?: throw IOException("OpenAI did not return a structured swing assessment.")
-            return Json.decodeFromString<LlmContentDto>(text)
+        } finally {
+            cancellationHandle.dispose()
         }
     }
 
@@ -61,6 +95,7 @@ class OpenAiAssessmentClient(
         put("model", model)
         put("instructions", INSTRUCTIONS)
         put("store", false)
+        put("stream", true)
         putJsonObject("text") {
             putJsonObject("format") {
                 put("type", "json_schema")
@@ -101,20 +136,6 @@ class OpenAiAssessmentClient(
                 }
             }
         }
-    }
-
-    private fun extractOutputText(response: JsonElement): String? {
-        val root = response.jsonObject
-        root["output_text"]?.jsonPrimitive?.contentOrNull?.let { return it }
-        val output = root["output"] as? JsonArray ?: return null
-        output.forEach { item ->
-            val content = item.jsonObject["content"] as? JsonArray ?: return@forEach
-            content.forEach { contentItem ->
-                val obj = contentItem.jsonObject
-                obj["text"]?.jsonPrimitive?.contentOrNull?.let { return it }
-            }
-        }
-        return null
     }
 
     private fun contentSchema(): JsonObject = buildJsonObject {
@@ -258,6 +279,86 @@ class OpenAiAssessmentClient(
             phase labels as body-pose timing proxies, not observed shaft measurements.
             Include limitations when images or 2D pose evidence cannot support a conclusion.
         """.trimIndent()
+    }
+}
+
+internal class ResponsesStreamAccumulator(
+    private val onDraft: (LlmContentDraft) -> Unit,
+    private val nanoTime: () -> Long = System::nanoTime,
+) {
+    private val outputText = StringBuilder()
+    private val refusalText = StringBuilder()
+    private val draftParser = LlmDraftParser()
+    private var completed = false
+    private var lastDraft: LlmContentDraft? = null
+    private var lastDraftAt = 0L
+
+    fun acceptEvent(data: String) {
+        if (data.isBlank() || data == "[DONE]") return
+        val event = try {
+            Json.parseToJsonElement(data).jsonObject
+        } catch (exc: Exception) {
+            throw IOException("OpenAI returned an invalid streaming event.", exc)
+        }
+        when (event["type"]?.jsonPrimitive?.contentOrNull) {
+            "response.output_text.delta" -> {
+                outputText.append(event.stringValue("delta"))
+                emitDraft(force = false)
+            }
+            "response.output_text.done" -> {
+                event["text"]?.jsonPrimitive?.contentOrNull?.let { finalText ->
+                    if (finalText.isNotEmpty()) {
+                        outputText.clear()
+                        outputText.append(finalText)
+                    }
+                }
+                emitDraft(force = true)
+            }
+            "response.refusal.delta" -> refusalText.append(event.stringValue("delta"))
+            "response.completed" -> completed = true
+            "error", "response.error", "response.failed", "response.incomplete" -> {
+                throw IOException(openAiEventError(event))
+            }
+        }
+    }
+
+    fun finishedOutput(): String {
+        if (refusalText.isNotBlank()) {
+            throw IOException("OpenAI refused the swing assessment request: $refusalText")
+        }
+        if (!completed) {
+            throw IOException("OpenAI swing assessment stream ended before completion.")
+        }
+        if (outputText.isBlank()) {
+            throw IOException("OpenAI did not return a structured swing assessment.")
+        }
+        emitDraft(force = true)
+        return outputText.toString()
+    }
+
+    private fun emitDraft(force: Boolean) {
+        val draft = draftParser.parse(outputText.toString())
+        if (!draft.hasVisibleContent || draft == lastDraft) return
+        val now = nanoTime()
+        if (!force && lastDraft != null && now - lastDraftAt < DRAFT_INTERVAL_NANOS) return
+        lastDraft = draft
+        lastDraftAt = now
+        onDraft(draft)
+    }
+
+    private fun JsonObject.stringValue(key: String): String =
+        this[key]?.jsonPrimitive?.contentOrNull
+            ?: throw IOException("OpenAI streaming event is missing $key.")
+
+    private fun openAiEventError(event: JsonObject): String {
+        val error = event["error"] as? JsonObject
+            ?: (event["response"] as? JsonObject)?.get("error") as? JsonObject
+        val message = error?.get("message")?.jsonPrimitive?.contentOrNull
+        return "OpenAI swing assessment stream failed${message?.let { ": $it" }.orEmpty()}."
+    }
+
+    private companion object {
+        const val DRAFT_INTERVAL_NANOS = 75_000_000L
     }
 }
 

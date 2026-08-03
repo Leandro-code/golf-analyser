@@ -117,6 +117,38 @@ data class LlmContentDto(
     val limitations: List<String> = emptyList(),
 )
 
+data class LlmObservationDraft(
+    val title: String = "",
+    val observation: String = "",
+)
+
+data class LlmPriorityDraft(
+    val title: String = "",
+    val rationale: String = "",
+    val practiceCue: String = "",
+    val explanation: String = "",
+    val drills: List<String> = emptyList(),
+    val practicePlan: List<String> = emptyList(),
+)
+
+data class LlmContentDraft(
+    val overview: String = "",
+    val strengths: List<String> = emptyList(),
+    val observations: List<LlmObservationDraft> = emptyList(),
+    val priorities: List<LlmPriorityDraft> = emptyList(),
+    val limitations: List<String> = emptyList(),
+) {
+    val hasVisibleContent: Boolean
+        get() = overview.isNotBlank() ||
+            strengths.any(String::isNotBlank) ||
+            observations.any { it.title.isNotBlank() || it.observation.isNotBlank() } ||
+            priorities.any {
+                it.title.isNotBlank() || it.rationale.isNotBlank() ||
+                    it.practiceCue.isNotBlank() || it.explanation.isNotBlank() ||
+                    it.drills.any(String::isNotBlank) || it.practicePlan.any(String::isNotBlank)
+            } || limitations.any(String::isNotBlank)
+}
+
 @Serializable
 data class LlmAssessmentDto(
     @SerialName("schema_version") val schemaVersion: String,
