@@ -1,11 +1,15 @@
 package com.golfanalyser.app.data
 
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.job
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -39,7 +43,10 @@ class OpenAiAssessmentClient(
         payload: JsonObject,
         evidenceFrames: List<ExportedEvidenceFrame>,
         onDraft: (LlmContentDraft) -> Unit = {},
-    ): LlmContentDto = withContext(Dispatchers.IO) {
+    ): LlmContentDto {
+        val callingJob = currentCoroutineContext().job
+        try {
+            return runInterruptible(Dispatchers.IO) {
         val body = requestPayload(settings.model, payload, evidenceFrames).toString()
             .toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
@@ -50,14 +57,19 @@ class OpenAiAssessmentClient(
             .post(body)
             .build()
         val call = httpClient.newCall(request)
-        val cancellationHandle = currentCoroutineContext().job.invokeOnCompletion { cause ->
+        val cancellationHandle = callingJob.invokeOnCompletion { cause ->
             if (cause != null) call.cancel()
         }
         try {
             call.execute().use { response ->
                 if (!response.isSuccessful) {
                     val responseBody = response.body?.string().orEmpty()
-                    throw IOException("OpenAI swing assessment request failed: HTTP ${response.code} $responseBody")
+                    val error = parseOpenAiError(responseBody)
+                    throw OpenAiApiException(
+                        statusCode = response.code,
+                        errorCode = error?.get("code")?.jsonPrimitive?.contentOrNull,
+                        apiMessage = error?.get("message")?.jsonPrimitive?.contentOrNull,
+                    )
                 }
                 val responseBody = response.body
                     ?: throw IOException("OpenAI swing assessment response was empty.")
@@ -76,7 +88,7 @@ class OpenAiAssessmentClient(
                 }
                 if (dataLines.isNotEmpty()) accumulator.acceptEvent(dataLines.joinToString("\n"))
                 val outputText = accumulator.finishedOutput()
-                return@withContext try {
+                return@runInterruptible try {
                     Json.decodeFromString<LlmContentDto>(outputText)
                 } catch (exc: Exception) {
                     throw IOException("OpenAI returned an invalid structured swing assessment: ${exc.message}", exc)
@@ -84,6 +96,13 @@ class OpenAiAssessmentClient(
             }
         } finally {
             cancellationHandle.dispose()
+        }
+            }
+        } catch (io: IOException) {
+            if (!callingJob.isActive) {
+                throw CancellationException("OpenAI assessment cancelled.").also { it.initCause(io) }
+            }
+            throw io
         }
     }
 
@@ -137,6 +156,10 @@ class OpenAiAssessmentClient(
             }
         }
     }
+
+    private fun parseOpenAiError(body: String): JsonObject? = runCatching {
+        Json.parseToJsonElement(body).jsonObject["error"]?.jsonObject
+    }.getOrNull()
 
     private fun contentSchema(): JsonObject = buildJsonObject {
         put("type", "object")
@@ -279,6 +302,39 @@ class OpenAiAssessmentClient(
             phase labels as body-pose timing proxies, not observed shaft measurements.
             Include limitations when images or 2D pose evidence cannot support a conclusion.
         """.trimIndent()
+    }
+}
+
+class OpenAiApiException(
+    val statusCode: Int,
+    val errorCode: String?,
+    val apiMessage: String?,
+) : IOException("OpenAI request failed with HTTP $statusCode.")
+
+fun openAiErrorMessage(throwable: Throwable): String {
+    val cause = generateSequence(throwable) { it.cause }.firstOrNull {
+        it is OpenAiApiException || it is UnknownHostException ||
+            it is ConnectException || it is SocketTimeoutException
+    } ?: throwable
+    return when (cause) {
+        is OpenAiApiException -> when {
+            cause.statusCode == 401 || cause.statusCode == 403 ->
+                "OpenAI rejected this API key. Check or replace it in Settings."
+            cause.statusCode == 404 || cause.errorCode == "model_not_found" ->
+                "The configured OpenAI assessment model is unavailable for this API key."
+            cause.statusCode == 429 ->
+                "OpenAI rate limit or quota reached. Wait and retry, or check API billing and limits."
+            cause.statusCode == 408 ->
+                "The OpenAI request timed out. Check your connection and retry."
+            cause.statusCode >= 500 ->
+                "OpenAI is temporarily unavailable. Please retry shortly."
+            else -> "OpenAI could not process this assessment request (HTTP ${cause.statusCode})."
+        }
+        is SocketTimeoutException ->
+            "The OpenAI request timed out. Check your connection and retry."
+        is UnknownHostException, is ConnectException ->
+            "No connection to OpenAI. Check internet access and retry."
+        else -> throwable.message ?: "Unable to generate AI assessment."
     }
 }
 

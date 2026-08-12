@@ -1,16 +1,52 @@
 package com.golfanalyser.app.data
 
 import java.io.IOException
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OpenAiAssessmentClientTest {
+    @Test
+    fun cancellationClosesAnInFlightOpenAiCall() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setSocketPolicy(SocketPolicy.NO_RESPONSE),
+            )
+            val client = OpenAiAssessmentClient(
+                httpClient = okhttp3.OkHttpClient(),
+                endpoint = server.url("/v1/responses"),
+            )
+            val generation = launch(Dispatchers.Default) {
+                client.generate(
+                    settings = OpenAiSettings("test-key"),
+                    payload = buildJsonObject { put("context", "test") },
+                    evidenceFrames = emptyList(),
+                )
+            }
+            assertTrue(server.takeRequest(10, TimeUnit.SECONDS) != null)
+
+            generation.cancelAndJoin()
+
+            assertTrue(generation.isCancelled)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test
     fun streamsReadableDraftsThenReturnsStrictFinalContent() = runTest {
         val server = MockWebServer()

@@ -7,10 +7,13 @@ import androidx.lifecycle.viewModelScope
 import com.golfanalyser.app.data.AnalysisRepository
 import com.golfanalyser.app.data.AnalysisResultResponse
 import com.golfanalyser.app.data.AnalysisStatusResponse
+import com.golfanalyser.app.data.AnalysisStorageUsage
+import com.golfanalyser.app.data.AnalysisWorkCoordinator
 import com.golfanalyser.app.data.ArtifactCache
 import com.golfanalyser.app.data.ContextPayload
 import com.golfanalyser.app.data.LlmContentDraft
 import com.golfanalyser.app.data.OpenAiSettings
+import com.golfanalyser.app.data.openAiErrorMessage
 import com.golfanalyser.app.data.buildPhaseConfirmationPayload
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -49,9 +52,11 @@ data class AppUiState(
     val status: AnalysisStatusResponse? = null,
     val result: AnalysisResultResponse? = null,
     val history: List<AnalysisResultResponse> = emptyList(),
+    val storageUsage: AnalysisStorageUsage = AnalysisStorageUsage(0L, 0, emptyMap()),
     val phaseFrames: Map<String, String> = emptyMap(),
     val openAiApiKey: String = "",
     val openAiModel: String = "",
+    val hasSavedOpenAiApiKey: Boolean = false,
     val replayState: ReplayState = ReplayState.NotLoaded,
     val isBusy: Boolean = false,
     val isGeneratingAi: Boolean = false,
@@ -71,17 +76,24 @@ enum class Screen {
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = AnalysisRepository(application)
+    private val analysisWork = AnalysisWorkCoordinator(application)
     private val _uiState = MutableStateFlow(AppUiState())
     val uiState: StateFlow<AppUiState> = _uiState
     private var pollingJob: Job? = null
     private var replayJob: Job? = null
     private var aiGenerationJob: Job? = null
+    private var screenBeforeSettings: Screen = Screen.NewSwing
 
     init {
         val openAi = repository.openAiSettings()
         _uiState.update {
-            it.copy(openAiApiKey = openAi.apiKey, openAiModel = openAi.model)
+            it.copy(
+                openAiApiKey = openAi.apiKey,
+                openAiModel = openAi.model,
+                hasSavedOpenAiApiKey = openAi.hasApiKey,
+            )
         }
+        resumePendingAnalysis()
     }
 
     fun selectVideo(uri: Uri) {
@@ -114,12 +126,35 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun showSettings() {
         cancelAiGeneration()
+        if (_uiState.value.screen != Screen.Settings) {
+            screenBeforeSettings = _uiState.value.screen
+        }
         val openAi = repository.openAiSettings()
         _uiState.update {
             it.copy(
                 screen = Screen.Settings,
                 openAiApiKey = openAi.apiKey,
                 openAiModel = openAi.model,
+                hasSavedOpenAiApiKey = openAi.hasApiKey,
+                error = null,
+                message = null,
+            )
+        }
+    }
+
+    fun closeSettings() {
+        val openAi = repository.openAiSettings()
+        val destination = when (screenBeforeSettings) {
+            Screen.Processing, Screen.Settings -> Screen.NewSwing
+            Screen.Result -> if (_uiState.value.result == null) Screen.NewSwing else Screen.Result
+            else -> screenBeforeSettings
+        }
+        _uiState.update {
+            it.copy(
+                screen = destination,
+                openAiApiKey = openAi.apiKey,
+                openAiModel = openAi.model,
+                hasSavedOpenAiApiKey = openAi.hasApiKey,
                 error = null,
                 message = null,
             )
@@ -130,18 +165,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(openAiApiKey = value) }
     }
 
-    fun updateOpenAiModel(value: String) {
-        _uiState.update { it.copy(openAiModel = value) }
-    }
-
     fun saveSettings() {
-        repository.saveOpenAiSettings(
-            OpenAiSettings(
-                apiKey = _uiState.value.openAiApiKey,
-                model = _uiState.value.openAiModel,
-            ),
+        val settings = OpenAiSettings(
+            apiKey = _uiState.value.openAiApiKey.trim(),
         )
-        _uiState.update { it.copy(message = "Settings saved.", error = null) }
+        repository.saveOpenAiSettings(settings)
+        val savedSettings = repository.openAiSettings()
+        _uiState.update {
+            it.copy(
+                openAiApiKey = savedSettings.apiKey,
+                openAiModel = savedSettings.model,
+                hasSavedOpenAiApiKey = savedSettings.hasApiKey,
+                message = if (savedSettings.hasApiKey) "API key saved." else "API key removed.",
+                error = null,
+            )
+        }
     }
 
     fun showResult(result: AnalysisResultResponse) {
@@ -181,11 +219,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         message = "Preparing selected video",
                     )
                 }
-                val created = repository.createAnalysis(video, _uiState.value.context) { status ->
-                    _uiState.update {
-                        it.copy(status = status, message = status.message, screen = Screen.Processing)
-                    }
-                }
+                val created = repository.reserveAnalysis(video, _uiState.value.context)
+                _uiState.update { it.copy(status = created.status, message = created.status.message) }
+                analysisWork.enqueue(created.runId)
                 repository.pollUntilComplete(created.runId) { status ->
                     _uiState.update {
                         it.copy(status = status, message = status.message, screen = Screen.Processing)
@@ -194,6 +230,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }.onSuccess { result ->
                 showResult(result)
             }.onFailure { throwable ->
+                if (throwable is CancellationException) return@onFailure
                 _uiState.update {
                     it.copy(
                         screen = Screen.NewSwing,
@@ -205,16 +242,100 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun cancelPoseAnalysis() {
+        val runId = _uiState.value.status?.runId ?: return
+        pollingJob?.cancel()
+        pollingJob = null
+        viewModelScope.launch {
+            repository.cancelAnalysis(runId)
+            analysisWork.cancel(runId)
+            _uiState.update {
+                it.copy(
+                    screen = Screen.NewSwing,
+                    status = null,
+                    isBusy = false,
+                    message = "Analysis cancelled. The selected video remains available to retry.",
+                    error = null,
+                )
+            }
+        }
+    }
+
     fun loadHistory() {
         cancelAiGeneration()
         viewModelScope.launch {
             runCatching {
                 _uiState.update { it.copy(screen = Screen.History, isBusy = true, error = null) }
-                repository.listAnalyses()
-            }.onSuccess { history ->
-                _uiState.update { it.copy(history = history, isBusy = false) }
+                repository.listAnalyses() to repository.storageUsage()
+            }.onSuccess { (history, usage) ->
+                _uiState.update { it.copy(history = history, storageUsage = usage, isBusy = false) }
             }.onFailure { throwable ->
                 _uiState.update { it.copy(isBusy = false, error = throwable.message ?: "Unable to load history.") }
+            }
+        }
+    }
+
+    fun deleteAnalysis(runId: String) {
+        if (_uiState.value.isBusy) return
+        cancelAiGeneration()
+        replayJob?.cancel()
+        viewModelScope.launch {
+            runCatching {
+                _uiState.update { it.copy(isBusy = true, error = null, message = "Deleting analysis...") }
+                repository.deleteAnalysis(runId)
+                repository.listAnalyses() to repository.storageUsage()
+            }.onSuccess { (history, usage) ->
+                _uiState.update { state ->
+                    state.copy(
+                        screen = Screen.History,
+                        history = history,
+                        storageUsage = usage,
+                        result = if (state.result?.runId == runId) null else state.result,
+                        replayState = if (state.result?.runId == runId) ReplayState.NotLoaded else state.replayState,
+                        isBusy = false,
+                        message = "Analysis deleted.",
+                    )
+                }
+            }.onFailure { throwable ->
+                _uiState.update {
+                    it.copy(isBusy = false, message = null, error = throwable.message ?: "Unable to delete analysis.")
+                }
+            }
+        }
+    }
+
+    fun deleteAllLocalData() {
+        if (_uiState.value.isBusy) return
+        pollingJob?.cancel()
+        replayJob?.cancel()
+        cancelAiGeneration()
+        viewModelScope.launch {
+            runCatching {
+                _uiState.update { it.copy(isBusy = true, error = null, message = "Deleting local data...") }
+                repository.deleteAllLocalData()
+            }.onSuccess {
+                val openAi = repository.openAiSettings()
+                _uiState.update {
+                    it.copy(
+                        screen = Screen.NewSwing,
+                        selectedVideo = null,
+                        status = null,
+                        result = null,
+                        history = emptyList(),
+                        storageUsage = AnalysisStorageUsage(0L, 0, emptyMap()),
+                        phaseFrames = emptyMap(),
+                        openAiApiKey = openAi.apiKey,
+                        openAiModel = openAi.model,
+                        hasSavedOpenAiApiKey = openAi.hasApiKey,
+                        replayState = ReplayState.NotLoaded,
+                        isBusy = false,
+                        message = "All local analyses and settings were deleted.",
+                    )
+                }
+            }.onFailure { throwable ->
+                _uiState.update {
+                    it.copy(isBusy = false, message = null, error = throwable.message ?: "Unable to delete local data.")
+                }
             }
         }
     }
@@ -293,9 +414,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         startAiAssessment(force = true)
     }
 
+    fun cancelAiAssessment() {
+        if (!_uiState.value.isGeneratingAi) return
+        cancelAiGeneration()
+        _uiState.update { it.copy(message = "AI assessment cancelled.", error = null) }
+    }
+
     private fun startAiAssessment(force: Boolean) {
         val result = _uiState.value.result ?: return
         if (_uiState.value.isGeneratingAi) return
+        if (!_uiState.value.hasSavedOpenAiApiKey) {
+            showSettings()
+            _uiState.update {
+                it.copy(message = "Enter an OpenAI API key to generate an AI assessment.")
+            }
+            return
+        }
         val runId = result.runId
         val action = if (force) "Regenerating" else "Generating"
         val completedAction = if (force) "regenerated" else "generated"
@@ -339,7 +473,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         it.copy(
                             isGeneratingAi = false,
                             aiAssessmentDraft = null,
-                            error = throwable.message ?: "Unable to generate AI assessment.",
+                            error = openAiErrorMessage(throwable),
                             message = null,
                         )
                     } else {
@@ -362,6 +496,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 it.copy(isGeneratingAi = false, aiAssessmentDraft = null)
             } else {
                 it
+            }
+        }
+    }
+
+    private fun resumePendingAnalysis() {
+        pollingJob = viewModelScope.launch {
+            val pending = runCatching { repository.latestPendingAnalysis() }.getOrNull() ?: return@launch
+            _uiState.update {
+                it.copy(
+                    screen = Screen.Processing,
+                    status = pending,
+                    isBusy = true,
+                    message = pending.message,
+                    error = null,
+                )
+            }
+            analysisWork.enqueue(pending.runId)
+            try {
+                val result = repository.pollUntilComplete(pending.runId) { status ->
+                    _uiState.update { it.copy(status = status, message = status.message) }
+                }
+                showResult(result)
+            } catch (cancelled: CancellationException) {
+                if (_uiState.value.status?.runId == pending.runId) {
+                    _uiState.update {
+                        it.copy(screen = Screen.NewSwing, status = null, isBusy = false, message = "Analysis cancelled.")
+                    }
+                }
+            } catch (throwable: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        screen = Screen.NewSwing,
+                        status = null,
+                        isBusy = false,
+                        error = throwable.message ?: "Analysis failed.",
+                    )
+                }
             }
         }
     }

@@ -10,6 +10,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,6 +28,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -98,7 +101,7 @@ fun GolfAnalyserApp(viewModel: AppViewModel = viewModel()) {
         Surface(modifier = Modifier.fillMaxSize()) {
             when (state.screen) {
                 Screen.NewSwing -> NewSwingScreen(state, viewModel)
-                Screen.Processing -> ProcessingScreen(state)
+                Screen.Processing -> ProcessingScreen(state, viewModel)
                 Screen.Result -> ResultScreen(state, viewModel)
                 Screen.History -> HistoryScreen(state, viewModel)
                 Screen.PhaseReview -> PhaseReviewScreen(state, viewModel)
@@ -166,6 +169,9 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
                     color = MaterialTheme.colorScheme.secondary,
                 )
             }
+            if (!state.hasSavedOpenAiApiKey) {
+                item { MissingApiKeyCard(viewModel::showSettings) }
+            }
             item {
                 Button(
                     onClick = { picker.launch(arrayOf("video/*")) },
@@ -225,16 +231,21 @@ private fun ContextControls(context: ContextPayload, onChange: (ContextPayload) 
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ChipGroup(label: String, value: String, options: List<String>, onChange: (String) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(label, style = MaterialTheme.typography.labelLarge)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             options.forEach { option ->
                 FilterChip(
                     selected = option == value,
                     onClick = { onChange(option) },
-                    label = { Text(option.readable()) },
+                    label = { Text(option.readable(), maxLines = 1) },
                 )
             }
         }
@@ -242,7 +253,7 @@ private fun ChipGroup(label: String, value: String, options: List<String>, onCha
 }
 
 @Composable
-private fun ProcessingScreen(state: AppUiState) {
+private fun ProcessingScreen(state: AppUiState, viewModel: AppViewModel) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -257,17 +268,54 @@ private fun ProcessingScreen(state: AppUiState) {
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(state.status?.message ?: state.message ?: "Processing swing")
+            OutlinedButton(onClick = viewModel::cancelPoseAnalysis) {
+                Text("Cancel analysis")
+            }
         }
     }
 }
 
 @Composable
 private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
+    var runToDelete by remember { mutableStateOf<String?>(null) }
+    var confirmDeleteAll by remember { mutableStateOf(false) }
+    runToDelete?.let { runId ->
+        AlertDialog(
+            onDismissRequest = { runToDelete = null },
+            title = { Text("Delete this analysis?") },
+            text = { Text("The saved video, pose data, extracted frames, and assessment will be permanently removed.") },
+            confirmButton = {
+                Button(onClick = { runToDelete = null; viewModel.deleteAnalysis(runId) }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { runToDelete = null }) { Text("Cancel") } },
+        )
+    }
+    if (confirmDeleteAll) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteAll = false },
+            title = { Text("Delete all local data?") },
+            text = {
+                Text(
+                    "This permanently removes every saved analysis, video, extracted frame, AI assessment, " +
+                        "and the API key stored in Settings.",
+                )
+            },
+            confirmButton = {
+                Button(onClick = { confirmDeleteAll = false; viewModel.deleteAllLocalData() }) {
+                    Text("Delete everything")
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteAll = false }) { Text("Cancel") } },
+        )
+    }
     AppScaffold(
         title = "Saved analyses",
         actions = {
             TextButton(onClick = viewModel::showSettings) { Text("Settings") }
-            TextButton(onClick = viewModel::clearDownloadedReplays) { Text("Clear replays") }
+            TextButton(
+                onClick = { confirmDeleteAll = true },
+                enabled = !state.isBusy && (state.storageUsage.analysisCount > 0 || state.hasSavedOpenAiApiKey),
+            ) { Text("Delete all") }
             TextButton(onClick = viewModel::showNewSwing) { Text("New") }
         },
     ) { padding ->
@@ -280,13 +328,36 @@ private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
         ) {
             if (state.isBusy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
             if (state.error != null) item { ErrorBanner(state.error) }
+            if (state.message != null) item { InfoBanner(state.message) }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Local storage", fontWeight = FontWeight.Bold)
+                        Text(
+                            "${formatBytes(state.storageUsage.totalBytes)} used by " +
+                                "${state.storageUsage.analysisCount} saved " +
+                                if (state.storageUsage.analysisCount == 1) "analysis" else "analyses",
+                        )
+                    }
+                }
+            }
             items(state.history) { result ->
                 Card(onClick = { viewModel.openHistoryResult(result.runId) }) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(result.runId, fontWeight = FontWeight.Bold)
                         Text(result.context?.let { "${it.cameraView.readable()} / ${it.clubFamily.readable()}" } ?: "Legacy run")
+                        Text(
+                            formatBytes(state.storageUsage.bytesByRunId[result.runId] ?: 0L),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                        )
                         if (result.llmAssessmentCurrent) Text("AI assessment ready", color = MaterialTheme.colorScheme.primary)
                         if (result.llmAssessmentStale) Text("AI assessment is stale", color = Color(0xFF8A3B12))
+                        OutlinedButton(
+                            onClick = { runToDelete = result.runId },
+                            enabled = !state.isBusy,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Delete analysis") }
                     }
                 }
             }
@@ -297,6 +368,49 @@ private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
 @Composable
 private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
     val result = state.result ?: return
+    var pendingAiRequest by remember(result.runId) { mutableStateOf<Boolean?>(null) }
+    var confirmDelete by remember(result.runId) { mutableStateOf(false) }
+    val requestAiAssessment: (Boolean) -> Unit = { force ->
+        if (!state.hasSavedOpenAiApiKey) {
+            viewModel.showSettings()
+        } else {
+            pendingAiRequest = force
+        }
+    }
+    pendingAiRequest?.let { force ->
+        AlertDialog(
+            onDismissRequest = { pendingAiRequest = null },
+            title = { Text(if (force) "Regenerate AI assessment?" else "Send evidence to OpenAI?") },
+            text = {
+                Text(
+                    "Selected swing still images, capture context, local pose measurements, and quality metadata " +
+                        "will be sent over HTTPS to OpenAI. The full video is not uploaded.",
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingAiRequest = null
+                        if (force) viewModel.regenerateAiAssessment() else viewModel.generateAiAssessment()
+                    },
+                ) { Text("Send and generate") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingAiRequest = null }) { Text("Cancel") }
+            },
+        )
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete this analysis?") },
+            text = { Text("The saved video, pose data, extracted frames, and assessment will be permanently removed.") },
+            confirmButton = {
+                Button(onClick = { confirmDelete = false; viewModel.deleteAnalysis(result.runId) }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+    }
     AppScaffold(
         title = "Swing analysis",
         actions = {
@@ -318,23 +432,45 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
             item {
                 ResultHeader(result)
             }
+            item {
+                OutlinedButton(
+                    onClick = { confirmDelete = true },
+                    enabled = !state.isBusy && !state.isGeneratingAi,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Delete analysis") }
+            }
             if (state.error != null) item { ErrorBanner(state.error) }
             if (state.message != null) item { InfoBanner(state.message) }
             item {
-                AiAssessmentCard(result, state.isGeneratingAi, state.aiAssessmentDraft, viewModel)
+                AiAssessmentCard(
+                    result = result,
+                    isGenerating = state.isGeneratingAi,
+                    draft = state.aiAssessmentDraft,
+                    hasApiKey = state.hasSavedOpenAiApiKey,
+                    viewModel = viewModel,
+                    onGenerate = { requestAiAssessment(false) },
+                )
             }
             item {
                 ActionRow(
                     onPhaseReview = viewModel::openPhaseReview,
                     onGenerateAi = {
-                        if (result.llmAssessmentCurrent) {
-                            viewModel.regenerateAiAssessment()
+                        if (!state.hasSavedOpenAiApiKey) {
+                            viewModel.showSettings()
+                        } else if (result.llmAssessmentCurrent) {
+                            requestAiAssessment(true)
                         } else {
-                            viewModel.generateAiAssessment()
+                            requestAiAssessment(false)
                         }
                     },
-                    aiButtonText = if (result.llmAssessmentCurrent) "Regenerate AI" else "AI assessment",
-                    aiEnabled = result.llmAssessmentEligibilityIssue == null && !state.isGeneratingAi,
+                    aiButtonText = when {
+                        !state.hasSavedOpenAiApiKey -> "Add API key"
+                        result.llmAssessmentCurrent -> "Regenerate AI"
+                        else -> "AI assessment"
+                    },
+                    aiEnabled = !state.isGeneratingAi && (
+                        !state.hasSavedOpenAiApiKey || result.llmAssessmentEligibilityIssue == null
+                    ),
                 )
             }
             item {
@@ -348,6 +484,18 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
             }
         }
     }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1_024) return "$bytes B"
+    val units = listOf("KB", "MB", "GB", "TB")
+    var value = bytes.toDouble()
+    var unitIndex = -1
+    while (value >= 1_024 && unitIndex < units.lastIndex) {
+        value /= 1_024
+        unitIndex += 1
+    }
+    return if (value >= 10) "${value.toInt()} ${units[unitIndex]}" else "${"%.1f".format(value)} ${units[unitIndex]}"
 }
 
 @Composable
@@ -540,15 +688,18 @@ private fun AiAssessmentCard(
     result: AnalysisResultResponse,
     isGenerating: Boolean,
     draft: LlmContentDraft?,
+    hasApiKey: Boolean,
     viewModel: AppViewModel,
+    onGenerate: () -> Unit,
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("AI Swing Assessment", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             val assessment = if (result.llmAssessmentCurrent) result.llmAssessment else null
             when {
-                isGenerating -> AiAssessmentLoading(draft, assessment)
+                isGenerating -> AiAssessmentLoading(draft, assessment, viewModel::cancelAiAssessment)
                 result.llmAssessmentStale -> WarningBanner("Saved AI assessment is stale. Regenerate after reviewing timing.")
+                assessment == null && !hasApiKey -> MissingApiKeyPrompt(viewModel::showSettings)
                 result.llmAssessmentEligibilityIssue != null -> {
                     WarningBanner(result.llmAssessmentEligibilityIssue)
                     Button(onClick = viewModel::openPhaseReview, modifier = Modifier.fillMaxWidth()) {
@@ -558,7 +709,7 @@ private fun AiAssessmentCard(
                 assessment == null -> {
                     Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
                     Button(
-                        onClick = viewModel::generateAiAssessment,
+                        onClick = onGenerate,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text("Generate AI assessment")
@@ -571,7 +722,32 @@ private fun AiAssessmentCard(
 }
 
 @Composable
-private fun AiAssessmentLoading(draft: LlmContentDraft?, previousAssessment: LlmAssessmentDto?) {
+private fun MissingApiKeyCard(onOpenSettings: () -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3D8))) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            MissingApiKeyPrompt(onOpenSettings)
+        }
+    }
+}
+
+@Composable
+private fun MissingApiKeyPrompt(onOpenSettings: () -> Unit) {
+    Text("OpenAI API key required", fontWeight = FontWeight.Bold, color = Color(0xFF70410E))
+    Text(
+        "Add your API key in Settings before generating an AI swing assessment.",
+        color = Color(0xFF70410E),
+    )
+    Button(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) {
+        Text("Open Settings")
+    }
+}
+
+@Composable
+private fun AiAssessmentLoading(
+    draft: LlmContentDraft?,
+    previousAssessment: LlmAssessmentDto?,
+    onCancel: () -> Unit,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -598,6 +774,9 @@ private fun AiAssessmentLoading(draft: LlmContentDraft?, previousAssessment: Llm
             }
         }
         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
+            Text("Cancel AI generation")
+        }
         if (draft?.hasVisibleContent == true) {
             LlmAssessmentDraftContent(draft)
         } else if (previousAssessment != null) {
@@ -767,7 +946,7 @@ private fun PhaseReviewScreen(state: AppUiState, viewModel: AppViewModel) {
 private fun SettingsScreen(state: AppUiState, viewModel: AppViewModel) {
     AppScaffold(
         title = "Settings",
-        actions = { TextButton(onClick = viewModel::showNewSwing) { Text("Done") } },
+        actions = { TextButton(onClick = viewModel::closeSettings) { Text("Done") } },
     ) { padding ->
         Column(
             modifier = Modifier
@@ -786,12 +965,23 @@ private fun SettingsScreen(state: AppUiState, viewModel: AppViewModel) {
                 visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
             )
-            OutlinedTextField(
-                value = state.openAiModel,
-                onValueChange = viewModel::updateOpenAiModel,
-                label = { Text("Model") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+            Text(
+                if (state.hasSavedOpenAiApiKey) {
+                    "An API key is configured. Saving an empty value removes it."
+                } else {
+                    "No API key is configured. Your key is stored in app settings on this device."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            Text(
+                "Assessment model: ${state.openAiModel}",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                "The model is fixed to the version tested with image evidence and structured results.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.secondary,
             )
             if (state.message != null) InfoBanner(state.message)
             if (state.error != null) ErrorBanner(state.error)

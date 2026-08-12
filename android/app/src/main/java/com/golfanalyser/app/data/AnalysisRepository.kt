@@ -23,6 +23,7 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
@@ -46,12 +47,17 @@ internal fun isUsableEvidenceJpeg(bytes: ByteArray): Boolean =
         bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() &&
         bytes[bytes.lastIndex - 1] == 0xFF.toByte() && bytes[bytes.lastIndex] == 0xD9.toByte()
 
+internal fun throwIfAnalysisCancelled(shouldCancel: () -> Boolean) {
+    if (shouldCancel()) throw CancellationException("Analysis cancelled.")
+}
+
 class AnalysisRepository(
     appContext: Context,
     private val openAiClient: OpenAiAssessmentClient = OpenAiAssessmentClient(),
 ) {
     private val contentResolver = appContext.contentResolver
     private val rootDir = File(appContext.filesDir, "analyses").apply { mkdirs() }
+    private val storage = AnalysisStorage(rootDir)
     private val settings = AppSettings(appContext)
     private val poseExtractor = MediaPipePoseExtractor(appContext)
 
@@ -60,10 +66,50 @@ class AnalysisRepository(
         context: ContextPayload,
         onStatus: (AnalysisStatusResponse) -> Unit = {},
     ): AnalysisCreateResponse = withContext(Dispatchers.IO) {
+        val reserved = reserveAnalysis(videoUri, context)
+        runReservedAnalysis(reserved.runId, onStatus = onStatus)
+    }
+
+    suspend fun reserveAnalysis(
+        videoUri: Uri,
+        context: ContextPayload,
+    ): AnalysisCreateResponse = withContext(Dispatchers.IO) {
         val runId = newRunId()
         val runDir = File(rootDir, runId).apply { mkdirs() }
-        val original = File(runDir, "original.mp4")
         val createdAt = nowIso()
+        AtomicTextFile.write(File(runDir, JOB_FILE),
+            json.encodeToString(AnalysisJobSpec(videoUri = videoUri.toString(), context = context)),
+        )
+        val queued = AnalysisStatusResponse(
+            runId = runId,
+            status = "queued",
+            progress = 0.0,
+            message = "Queued for on-device analysis",
+            createdAt = createdAt,
+            updatedAt = createdAt,
+        )
+        writeStatus(runDir, queued)
+        AnalysisCreateResponse(
+            runId = runId,
+            statusUrl = localStatusPath(runId),
+            resultUrl = localResultPath(runId),
+            status = queued,
+        )
+    }
+
+    suspend fun runReservedAnalysis(
+        runId: String,
+        shouldCancel: () -> Boolean = { false },
+        onStatus: (AnalysisStatusResponse) -> Unit = {},
+    ): AnalysisCreateResponse = withContext(Dispatchers.IO) {
+        val runDir = runDir(runId)
+        val original = File(runDir, "original.mp4")
+        val spec = AtomicTextFile.read(File(runDir, JOB_FILE)) { json.decodeFromString<AnalysisJobSpec>(it) }
+        val initialStatus = readStatus(runDir)
+        val createdAt = initialStatus.createdAt
+        val cancellationRequested = { shouldCancel() || File(runDir, CANCEL_FILE).exists() }
+        val performance = AnalysisPerformanceTracker(runId)
+        var performanceWritten = false
         var latestProgress = 0.0
 
         fun reportStatus(
@@ -72,6 +118,7 @@ class AnalysisRepository(
             status: String = "processing",
             error: String? = null,
         ): AnalysisStatusResponse {
+            performance.sample()
             latestProgress = progress
             val update = AnalysisStatusResponse(
                 runId = runId,
@@ -89,23 +136,49 @@ class AnalysisRepository(
 
         reportStatus(0.02, "Preparing selected video")
         try {
-            contentResolver.openInputStream(videoUri)?.use { input ->
-                original.outputStream().use { output -> input.copyTo(output) }
-            } ?: error("Unable to open selected video.")
+            throwIfAnalysisCancelled(cancellationRequested)
+            if (!original.isFile || original.length() == 0L) {
+                val staged = File(runDir, "original.mp4.pending")
+                contentResolver.openInputStream(Uri.parse(spec.videoUri))?.use { input ->
+                    staged.outputStream().use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            throwIfAnalysisCancelled(cancellationRequested)
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                } ?: error("Unable to open selected video.")
+                check(staged.length() > 0L) { "The selected video is empty." }
+                if (original.exists()) original.delete()
+                check(staged.renameTo(original)) { "Unable to save the selected video." }
+            }
 
             reportStatus(0.08, "Reading video details")
-            val result = analyseLocal(runId, runDir, original, context) { progress, message ->
+            val result = analyseLocal(runId, runDir, original, spec.context, cancellationRequested) { progress, message ->
                 reportStatus(progress, message)
             }
             reportStatus(0.96, "Saving analysis")
             writeResult(runDir, result)
             val completed = reportStatus(1.0, "Complete", status = "completed")
+            writePerformance(runDir, performance.finish("completed"))
+            performanceWritten = true
             AnalysisCreateResponse(
                 runId = runId,
                 statusUrl = localStatusPath(runId),
                 resultUrl = localResultPath(runId),
                 status = completed,
             )
+        } catch (cancelled: CancellationException) {
+            reportStatus(
+                progress = latestProgress,
+                message = "Analysis cancelled",
+                status = "cancelled",
+            )
+            writePerformance(runDir, performance.finish("cancelled"))
+            performanceWritten = true
+            throw cancelled
         } catch (throwable: Throwable) {
             reportStatus(
                 progress = latestProgress,
@@ -113,7 +186,37 @@ class AnalysisRepository(
                 status = "failed",
                 error = throwable.message ?: "Analysis failed.",
             )
+            writePerformance(runDir, performance.finish("failed"))
+            performanceWritten = true
             throw throwable
+        } finally {
+            if (!performanceWritten) {
+                writePerformance(runDir, performance.finish("interrupted"))
+            }
+        }
+    }
+
+    suspend fun latestPendingAnalysis(): AnalysisStatusResponse? = withContext(Dispatchers.IO) {
+        rootDir.listFiles()
+            ?.filter { it.isDirectory && File(it, STATUS_FILE).isFile }
+            ?.mapNotNull { runCatching { readStatus(it) }.getOrNull() }
+            ?.filter { it.status == "queued" || it.status == "processing" }
+            ?.maxByOrNull { it.updatedAt }
+    }
+
+    suspend fun cancelAnalysis(runId: String) = withContext(Dispatchers.IO) {
+        val directory = runDir(runId)
+        File(directory, CANCEL_FILE).writeText(nowIso())
+        val current = readStatus(directory)
+        if (current.status != "completed" && current.status != "failed") {
+            writeStatus(
+                directory,
+                current.copy(
+                    status = "cancelled",
+                    message = "Analysis cancelled",
+                    updatedAt = nowIso(),
+                ),
+            )
         }
     }
 
@@ -127,6 +230,19 @@ class AnalysisRepository(
 
     suspend fun getAnalysis(runId: String): AnalysisResultResponse = withContext(Dispatchers.IO) {
         currentResult(readResult(runDir(runId)))
+    }
+
+    suspend fun storageUsage(): AnalysisStorageUsage = withContext(Dispatchers.IO) {
+        storage.usage()
+    }
+
+    suspend fun deleteAnalysis(runId: String) = withContext(Dispatchers.IO) {
+        storage.deleteAnalysis(runId)
+    }
+
+    suspend fun deleteAllLocalData() = withContext(Dispatchers.IO) {
+        storage.deleteAllAnalyses()
+        settings.clearAll()
     }
 
     suspend fun confirmPhases(runId: String, frameIndices: List<Int>): AnalysisResultResponse = withContext(Dispatchers.IO) {
@@ -227,6 +343,7 @@ class AnalysisRepository(
             when (status.status) {
                 "completed" -> return readResult(runDir)
                 "failed" -> error(status.error ?: status.message)
+                "cancelled" -> throw CancellationException("Analysis cancelled.")
                 else -> delay(250)
             }
         }
@@ -239,11 +356,12 @@ class AnalysisRepository(
         runDir: File,
         original: File,
         context: ContextPayload,
+        shouldCancel: () -> Boolean,
         onProgress: (progress: Double, message: String) -> Unit,
     ): AnalysisResultResponse {
         val metadata = readVideoMetadata(original)
         onProgress(0.1, "Starting pose detection")
-        val landmarks = extractLandmarks(metadata) { processedFrames, totalFrames ->
+        val landmarks = extractLandmarks(metadata, shouldCancel) { processedFrames, totalFrames ->
             val frameProgress = processedFrames.toDouble() / totalFrames
             onProgress(
                 0.1 + (frameProgress * 0.78),
@@ -283,10 +401,11 @@ class AnalysisRepository(
 
     private fun extractLandmarks(
         metadata: VideoMetadata,
+        shouldCancel: () -> Boolean,
         onProgress: (processedFrames: Int, totalFrames: Int) -> Unit,
     ): List<LandmarkFrame> {
         val file = File(metadata.sourcePath)
-        return poseExtractor.extract(file, metadata, onProgress)
+        return poseExtractor.extract(file, metadata, shouldCancel, onProgress)
     }
 
     private fun readVideoMetadata(file: File): VideoMetadata {
@@ -633,25 +752,29 @@ class AnalysisRepository(
     }
 
     private fun writeResult(runDir: File, result: AnalysisResultResponse) {
-        File(runDir, RESULT_FILE).writeText(json.encodeToString(result))
+        AtomicTextFile.write(File(runDir, RESULT_FILE), json.encodeToString(result))
     }
 
     private fun readResult(runDir: File): AnalysisResultResponse =
-        json.decodeFromString(File(runDir, RESULT_FILE).readText())
+        AtomicTextFile.read(File(runDir, RESULT_FILE)) { json.decodeFromString(it) }
 
     private fun writeStatus(runDir: File, status: AnalysisStatusResponse) {
-        File(runDir, STATUS_FILE).writeText(json.encodeToString(status))
+        AtomicTextFile.write(File(runDir, STATUS_FILE), json.encodeToString(status))
+    }
+
+    private fun writePerformance(runDir: File, report: AnalysisPerformanceReport) {
+        AtomicTextFile.write(File(runDir, PERFORMANCE_FILE), json.encodeToString(report))
     }
 
     private fun readStatus(runDir: File): AnalysisStatusResponse =
-        json.decodeFromString(File(runDir, STATUS_FILE).readText())
+        AtomicTextFile.read(File(runDir, STATUS_FILE)) { json.decodeFromString(it) }
 
     private fun writeLandmarks(runDir: File, landmarks: List<LandmarkFrame>) {
-        File(runDir, LANDMARKS_FILE).writeText(json.encodeToString(landmarks))
+        AtomicTextFile.write(File(runDir, LANDMARKS_FILE), json.encodeToString(landmarks))
     }
 
     private fun readLandmarks(runDir: File): List<LandmarkFrame> =
-        json.decodeFromString(File(runDir, LANDMARKS_FILE).readText())
+        AtomicTextFile.read(File(runDir, LANDMARKS_FILE)) { json.decodeFromString(it) }
 
     private fun runDir(runId: String): File {
         require(File(runId).name == runId) { "Invalid analysis id." }
@@ -678,6 +801,9 @@ class AnalysisRepository(
         private const val RESULT_FILE = "result.json"
         private const val STATUS_FILE = "status.json"
         private const val LANDMARKS_FILE = "landmarks.json"
+        private const val JOB_FILE = "job.json"
+        private const val CANCEL_FILE = "cancel.requested"
+        private const val PERFORMANCE_FILE = "performance.json"
         private const val SCHEMA_VERSION = "1.0.0"
         private const val PROMPT_VERSION = "1.0.0"
         private const val NEIGHBOR_SECONDS = 0.1

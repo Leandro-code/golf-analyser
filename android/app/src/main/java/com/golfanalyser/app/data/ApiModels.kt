@@ -33,6 +33,12 @@ data class AnalysisCreateResponse(
 )
 
 @Serializable
+data class AnalysisJobSpec(
+    @SerialName("video_uri") val videoUri: String,
+    val context: ContextPayload,
+)
+
+@Serializable
 data class SwingPhaseDto(
     val name: String,
     @SerialName("frame_index") val frameIndex: Int,

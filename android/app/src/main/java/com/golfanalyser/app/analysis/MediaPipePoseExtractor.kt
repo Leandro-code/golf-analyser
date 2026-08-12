@@ -10,11 +10,13 @@ import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import java.io.File
 import kotlin.math.max
 import kotlin.math.roundToLong
+import kotlinx.coroutines.CancellationException
 
 class MediaPipePoseExtractor(private val context: Context) {
     fun extract(
         videoFile: File,
         metadata: VideoMetadata,
+        shouldCancel: () -> Boolean = { false },
         onProgress: (processedFrames: Int, totalFrames: Int) -> Unit = { _, _ -> },
     ): List<LandmarkFrame> {
         val baseOptions = BaseOptions.builder()
@@ -36,15 +38,20 @@ class MediaPipePoseExtractor(private val context: Context) {
                 val totalFrames = metadata.frameCount.coerceAtLeast(1)
                 val progressInterval = max(1, totalFrames / 100)
                 return (0 until totalFrames).map { index ->
+                    if (shouldCancel()) throw CancellationException("Analysis cancelled.")
                     val timestampSeconds = index / metadata.fps.coerceAtLeast(1e-9)
                     val bitmap = retriever.getFrameAtTime(
                         (timestampSeconds * 1_000_000).roundToLong(),
                         MediaMetadataRetriever.OPTION_CLOSEST,
                     )
-                    val frame = if (bitmap == null) {
-                        LandmarkFrame(index, timestampSeconds, poseDetected = false)
-                    } else {
-                        detectFrame(landmarker, bitmap, index, timestampSeconds)
+                    val frame = try {
+                        if (bitmap == null) {
+                            LandmarkFrame(index, timestampSeconds, poseDetected = false)
+                        } else {
+                            detectFrame(landmarker, bitmap, index, timestampSeconds)
+                        }
+                    } finally {
+                        bitmap?.recycle()
                     }
                     val processedFrames = index + 1
                     if (processedFrames == 1 || processedFrames == totalFrames || processedFrames % progressInterval == 0) {
@@ -69,27 +76,33 @@ class MediaPipePoseExtractor(private val context: Context) {
         } else {
             bitmap.copy(Bitmap.Config.ARGB_8888, false)
         }
-        val result = landmarker.detectForVideo(
-            BitmapImageBuilder(argb).build(),
-            (timestampSeconds * 1_000).roundToLong(),
-        )
-        val landmarks = result.landmarks().firstOrNull().orEmpty()
-        return LandmarkFrame(
-            frameIndex = frameIndex,
-            timestampSeconds = timestampSeconds,
-            poseDetected = landmarks.isNotEmpty(),
-            landmarks = landmarks.mapIndexed { index, landmark ->
-                LandmarkPoint(
-                    name = LANDMARK_NAMES.getOrElse(index) { "landmark_$index" },
-                    x = landmark.x().toDouble(),
-                    y = landmark.y().toDouble(),
-                    z = landmark.z().toDouble(),
-                    visibility = landmark.visibility().orElse(0f).toDouble(),
-                    pixelX = landmark.x().toDouble() * argb.width,
-                    pixelY = landmark.y().toDouble() * argb.height,
-                )
-            },
-        )
+        val image = BitmapImageBuilder(argb).build()
+        return try {
+            val result = landmarker.detectForVideo(
+                image,
+                (timestampSeconds * 1_000).roundToLong(),
+            )
+            val landmarks = result.landmarks().firstOrNull().orEmpty()
+            LandmarkFrame(
+                frameIndex = frameIndex,
+                timestampSeconds = timestampSeconds,
+                poseDetected = landmarks.isNotEmpty(),
+                landmarks = landmarks.mapIndexed { index, landmark ->
+                    LandmarkPoint(
+                        name = LANDMARK_NAMES.getOrElse(index) { "landmark_$index" },
+                        x = landmark.x().toDouble(),
+                        y = landmark.y().toDouble(),
+                        z = landmark.z().toDouble(),
+                        visibility = landmark.visibility().orElse(0f).toDouble(),
+                        pixelX = landmark.x().toDouble() * argb.width,
+                        pixelY = landmark.y().toDouble() * argb.height,
+                    )
+                },
+            )
+        } finally {
+            image.close()
+            if (argb !== bitmap) argb.recycle()
+        }
     }
 
     companion object {

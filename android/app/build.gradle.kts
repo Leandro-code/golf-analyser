@@ -6,32 +6,14 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-val localProperties = Properties().apply {
-    val file = rootProject.file("local.properties")
-    if (file.exists()) {
-        file.inputStream().use(::load)
-    }
+val internalSigningFile = rootProject.file("signing.properties")
+val releaseRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
+if (releaseRequested && !internalSigningFile.isFile) {
+    error("A signed release requires android/signing.properties. See signing.properties.example.")
 }
-
-val repoEnv = Properties().apply {
-    val file = rootProject.file("../.env")
-    if (file.exists()) {
-        file.readLines()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("#") && "=" in it }
-            .forEach { line ->
-                val key = line.substringBefore("=").trim()
-                val value = line.substringAfter("=").trim()
-                setProperty(key, value)
-            }
-    }
+val internalSigning = Properties().apply {
+    if (internalSigningFile.isFile) internalSigningFile.inputStream().use(::load)
 }
-
-fun localStringProperty(name: String): String =
-    providers.gradleProperty(name).orNull
-        ?: localProperties.getProperty(name)
-        ?: repoEnv.getProperty(name)
-        ?: ""
 
 android {
     namespace = "com.golfanalyser.app"
@@ -45,28 +27,30 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField(
-            "String",
-            "DEFAULT_OPENAI_MODEL",
-            "\"${localStringProperty("GOLF_ANALYSER_OPENAI_MODEL").ifBlank { "gpt-5.5" }}\"",
-        )
+    }
+
+    signingConfigs {
+        if (internalSigningFile.isFile) {
+            create("internalRelease") {
+                storeFile = rootProject.file(internalSigning.getProperty("storeFile"))
+                storePassword = internalSigning.getProperty("storePassword")
+                keyAlias = internalSigning.getProperty("keyAlias")
+                keyPassword = internalSigning.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
-        debug {
-            buildConfigField(
-                "String",
-                "DEBUG_OPENAI_API_KEY",
-                "\"${localStringProperty("OPENAI_API_KEY")}\"",
-            )
-        }
-        release {
-            buildConfigField("String", "DEBUG_OPENAI_API_KEY", "\"\"")
+        getByName("release") {
+            isDebuggable = false
+            isMinifyEnabled = false
+            if (internalSigningFile.isFile) {
+                signingConfig = signingConfigs.getByName("internalRelease")
+            }
         }
     }
 
     buildFeatures {
-        buildConfig = true
         compose = true
     }
     composeOptions {
@@ -92,6 +76,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
     implementation("androidx.navigation:navigation-compose:2.7.7")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("androidx.media3:media3-exoplayer:1.4.0")

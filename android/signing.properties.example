@@ -1,0 +1,6 @@
+# Copy this file to signing.properties and keep both the real properties file
+# and keystore private. Paths are relative to the android directory.
+storeFile=internal-release.keystore
+storePassword=replace-with-a-private-password
+keyAlias=golf-analyser-internal
+keyPassword=replace-with-a-private-password
