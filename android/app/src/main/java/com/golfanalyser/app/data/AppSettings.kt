@@ -42,12 +42,27 @@ class AppSettings(context: Context) {
             .apply()
     }
 
+    fun coachingFocus(): CoachingFocusDto = CoachingFocusDto(
+        goals = preferences.getStringSet(KEY_COACHING_GOALS, emptySet()).orEmpty().toList(),
+        customNote = preferences.getString(KEY_COACHING_NOTE, null),
+    ).normalized()
+
+    fun saveCoachingFocus(focus: CoachingFocusDto) {
+        val normalized = focus.normalized()
+        preferences.edit()
+            .putStringSet(KEY_COACHING_GOALS, normalized.goals.toSet())
+            .putString(KEY_COACHING_NOTE, normalized.customNote)
+            .apply()
+    }
+
     fun clearAll() {
         preferences.edit().clear().apply()
     }
 
     companion object {
         private const val KEY_OPENAI_API_KEY = "openai_api_key"
+        private const val KEY_COACHING_GOALS = "coaching_focus_goals"
+        private const val KEY_COACHING_NOTE = "coaching_focus_note"
         // Removed from the UI; retained only so upgrades erase older saved overrides.
         private const val KEY_OPENAI_MODEL = "openai_model"
     }

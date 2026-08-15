@@ -42,6 +42,7 @@ class OpenAiAssessmentClient(
         settings: OpenAiSettings,
         payload: JsonObject,
         evidenceFrames: List<ExportedEvidenceFrame>,
+        onProgress: (AiAssessmentStage) -> Unit = {},
         onDraft: (LlmContentDraft) -> Unit = {},
     ): LlmContentDto {
         val callingJob = currentCoroutineContext().job
@@ -73,7 +74,11 @@ class OpenAiAssessmentClient(
                 }
                 val responseBody = response.body
                     ?: throw IOException("OpenAI swing assessment response was empty.")
-                val accumulator = ResponsesStreamAccumulator(onDraft)
+                onProgress(AiAssessmentStage.ANALYSING_SWING)
+                val accumulator = ResponsesStreamAccumulator(
+                    onDraft = onDraft,
+                    onOutputStarted = { onProgress(AiAssessmentStage.WRITING_ADVICE) },
+                )
                 val dataLines = mutableListOf<String>()
                 responseBody.source().use { source ->
                     while (true) {
@@ -115,7 +120,12 @@ class OpenAiAssessmentClient(
         put("instructions", INSTRUCTIONS)
         put("store", false)
         put("stream", true)
+        put("max_output_tokens", 3_500)
+        putJsonObject("reasoning") {
+            put("effort", "medium")
+        }
         putJsonObject("text") {
+            put("verbosity", "low")
             putJsonObject("format") {
                 put("type", "json_schema")
                 put("name", "golf_swing_assessment")
@@ -132,7 +142,8 @@ class OpenAiAssessmentClient(
                         put(
                             "text",
                             "Produce the primary swing assessment from the supplied evidence packet. " +
-                                "Use only frame IDs supplied below when citing visual support.\n\n" +
+                                "Populate supporting_frame_ids with supplied IDs, but never include IDs or " +
+                                "technical evidence terminology in golfer-facing prose.\n\n" +
                                 evidencePayload.toString(),
                         )
                     }
@@ -173,9 +184,10 @@ class OpenAiAssessmentClient(
         }
         putJsonObject("properties") {
             putJsonObject("overview") { put("type", "string") }
-            put("strengths", stringArraySchema())
+            put("strengths", stringArraySchema(maxItems = 3))
             putJsonObject("observations") {
                 put("type", "array")
+                put("maxItems", 3)
                 put("items", observationSchema())
             }
             putJsonObject("priorities") {
@@ -183,7 +195,7 @@ class OpenAiAssessmentClient(
                 put("maxItems", 3)
                 put("items", prioritySchema())
             }
-            put("limitations", stringArraySchema())
+            put("limitations", stringArraySchema(maxItems = 2))
         }
     }
 
@@ -231,8 +243,8 @@ class OpenAiAssessmentClient(
                     add("null")
                 }
             }
-            put("drills", stringArraySchema(maxItems = 5))
-            put("practice_plan", stringArraySchema(maxItems = 5))
+            put("drills", stringArraySchema(maxItems = 2))
+            put("practice_plan", stringArraySchema(maxItems = 3))
             put("supporting_frame_ids", stringArraySchema())
             put("related_metric_keys", stringArraySchema())
             put("confidence", confidenceSchema())
@@ -279,28 +291,34 @@ class OpenAiAssessmentClient(
         }
 
         private val INSTRUCTIONS = """
-            You are the primary AI swing assessment writer for a golf swing review workbench.
-            You receive still images selected from an ordered full-swing replay,
-            capture context, deterministic 2D pose measurements, and local quality metadata.
+            You write concise, practical golf coaching for the golfer. You receive selected
+            swing images, capture context, measured body movement, and quality metadata.
 
-            Ground every observation and recommendation in supplied frame IDs and/or metrics.
+            Ground every observation and recommendation in supplied visual evidence and/or metrics.
             Treat supplied measurements as facts; do not recalculate or contradict them from
             the images. Prioritise up to three useful practice actions. Do not compare against
             target ranges, hidden standards, or normative thresholds. Use support_type
             ai_generated for every priority because no source-backed reference ranges are
             provided.
 
+            The input may include a golfer-provided coaching_focus. Use it to tailor
+            and order useful practice priorities, but treat it as a requested goal rather than
+            proof that the stated shot shape or fault occurred. Provide only supported advice.
+
             For each priority, include explanation, drills, and practice_plan fields that help
             the golfer understand what the priority means, rehearse it, and check progress.
-            Keep drills and plan steps concrete, short, and grounded in the supplied evidence.
-            Do not introduce claims that are unsupported by the supplied 2D pose frames,
-            measurements, or quality metadata.
+            Keep the overview to 2-3 short sentences. Keep rationale, explanation, drills, and
+            plan steps concrete and brief. Use at most two drills and three plan steps.
 
-            Limit analysis to visible 2D pose observations. Do not claim club path, clubface
+            Do not claim club path, clubface
             angle, strike/contact quality, ball flight, distance, power, overall score,
-            medical diagnosis, or comparison to a professional golfer. Treat shaft-parallel
-            phase labels as body-pose timing proxies, not observed shaft measurements.
-            Include limitations when images or 2D pose evidence cannot support a conclusion.
+            medical diagnosis, or comparison to a professional golfer.
+
+            The golfer-facing prose must never mention frame IDs, frames, still images, an
+            evidence packet, pose data, 2D evidence, missing clubface/path data, or other
+            implementation details. Put IDs only in supporting_frame_ids. Do not repeat generic
+            caveats. Add a limitation only when a specific evidence-quality issue materially
+            changes the advice, and state it once in plain golfer-friendly language.
         """.trimIndent()
     }
 }
@@ -340,12 +358,14 @@ fun openAiErrorMessage(throwable: Throwable): String {
 
 internal class ResponsesStreamAccumulator(
     private val onDraft: (LlmContentDraft) -> Unit,
+    private val onOutputStarted: () -> Unit = {},
     private val nanoTime: () -> Long = System::nanoTime,
 ) {
     private val outputText = StringBuilder()
     private val refusalText = StringBuilder()
     private val draftParser = LlmDraftParser()
     private var completed = false
+    private var outputStarted = false
     private var lastDraft: LlmContentDraft? = null
     private var lastDraftAt = 0L
 
@@ -358,10 +378,12 @@ internal class ResponsesStreamAccumulator(
         }
         when (event["type"]?.jsonPrimitive?.contentOrNull) {
             "response.output_text.delta" -> {
+                markOutputStarted()
                 outputText.append(event.stringValue("delta"))
                 emitDraft(force = false)
             }
             "response.output_text.done" -> {
+                markOutputStarted()
                 event["text"]?.jsonPrimitive?.contentOrNull?.let { finalText ->
                     if (finalText.isNotEmpty()) {
                         outputText.clear()
@@ -390,6 +412,13 @@ internal class ResponsesStreamAccumulator(
         }
         emitDraft(force = true)
         return outputText.toString()
+    }
+
+    private fun markOutputStarted() {
+        if (!outputStarted) {
+            outputStarted = true
+            onOutputStarted()
+        }
     }
 
     private fun emitDraft(force: Boolean) {

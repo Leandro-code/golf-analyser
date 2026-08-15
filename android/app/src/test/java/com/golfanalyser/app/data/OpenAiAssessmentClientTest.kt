@@ -8,11 +8,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.put
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -66,6 +68,7 @@ class OpenAiAssessmentClientTest {
                     .setBody(events),
             )
             val drafts = mutableListOf<LlmContentDraft>()
+            val progressStages = mutableListOf<AiAssessmentStage>()
             val client = OpenAiAssessmentClient(
                 httpClient = okhttp3.OkHttpClient(),
                 endpoint = server.url("/v1/responses"),
@@ -73,8 +76,26 @@ class OpenAiAssessmentClientTest {
 
             val result = client.generate(
                 settings = OpenAiSettings("test-key", "test-model"),
-                payload = buildJsonObject { put("context", "test") },
-                evidenceFrames = emptyList(),
+                payload = buildJsonObject {
+                    put("context", "test")
+                    put("coaching_focus", buildJsonObject {
+                        put("goals", buildJsonArray { add(kotlinx.serialization.json.JsonPrimitive("reduce_fade_or_slice")) })
+                        put("custom_note", "My usual miss is a fade.")
+                    })
+                },
+                evidenceFrames = listOf(
+                    ExportedEvidenceFrame(
+                        frame = SubmittedEvidenceFrameDto(
+                            frameId = "frame_000010",
+                            frameIndex = 10,
+                            timestampSeconds = 1.0,
+                            phaseRelations = listOf("Top (P4) anchor"),
+                            imageFile = "frame_000010.jpg",
+                        ),
+                        dataUrl = "data:image/jpeg;base64,/9j/2Q==",
+                    ),
+                ),
+                onProgress = progressStages::add,
                 onDraft = drafts::add,
             )
 
@@ -82,9 +103,23 @@ class OpenAiAssessmentClientTest {
             assertEquals("Sequence", result.priorities.single().title)
             assertTrue(drafts.isNotEmpty())
             assertEquals("A grounded overview.", drafts.last().overview)
+            assertEquals(
+                listOf(AiAssessmentStage.ANALYSING_SWING, AiAssessmentStage.WRITING_ADVICE),
+                progressStages,
+            )
             val request = server.takeRequest()
             assertEquals("text/event-stream", request.getHeader("Accept"))
-            assertTrue(request.body.readUtf8().contains("\"stream\":true"))
+            val requestBody = request.body.readUtf8()
+            assertTrue(requestBody.contains("\"stream\":true"))
+            assertTrue(requestBody.contains("\"max_output_tokens\":3500"))
+            assertTrue(requestBody.contains("\"reasoning\":{\"effort\":\"medium\"}"))
+            assertTrue(requestBody.contains("\"verbosity\":\"low\""))
+            assertTrue(requestBody.contains("\"detail\":\"high\""))
+            assertTrue(requestBody.contains("golfer-provided coaching_focus"))
+            assertTrue(requestBody.contains("never include IDs"))
+            assertFalse(requestBody.contains("missing clubface/path data in golfer-facing prose"))
+            assertTrue(requestBody.contains("reduce_fade_or_slice"))
+            assertTrue(requestBody.contains("My usual miss is a fade."))
         } finally {
             server.shutdown()
         }

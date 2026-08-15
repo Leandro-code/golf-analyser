@@ -20,6 +20,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import kotlin.math.max
+import kotlin.math.round
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 import kotlinx.coroutines.Dispatchers
@@ -46,6 +47,26 @@ internal fun isUsableEvidenceJpeg(bytes: ByteArray): Boolean =
     bytes.size >= 4 &&
         bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() &&
         bytes[bytes.lastIndex - 1] == 0xFF.toByte() && bytes[bytes.lastIndex] == 0xD9.toByte()
+
+internal fun roundedMeasurement(value: JsonElement): JsonElement {
+    val primitive = value as? JsonPrimitive ?: return value
+    if (primitive.isString) return value
+    val number = primitive.content.toDoubleOrNull() ?: return value
+    return JsonPrimitive(round(number * 100.0) / 100.0)
+}
+
+internal fun evidenceFrameOffsets(phaseName: String, neighborFrames: Int): List<Int> =
+    if (
+        phaseName in setOf(
+            SwingPhases.TOP_PHASE,
+            SwingPhases.P6_PHASE,
+            SwingPhases.IMPACT_PHASE,
+        )
+    ) {
+        listOf(-neighborFrames, 0, neighborFrames)
+    } else {
+        listOf(0)
+    }
 
 internal fun throwIfAnalysisCancelled(shouldCancel: () -> Boolean) {
     if (shouldCancel()) throw CancellationException("Analysis cancelled.")
@@ -268,7 +289,9 @@ class AnalysisRepository(
 
     suspend fun createLlmAssessment(
         runId: String,
+        coachingFocus: CoachingFocusDto,
         force: Boolean = false,
+        onProgress: (AiAssessmentStage) -> Unit = {},
         onDraft: (LlmContentDraft) -> Unit = {},
     ): AnalysisResultResponse = withContext(Dispatchers.IO) {
         val runDir = runDir(runId)
@@ -281,12 +304,22 @@ class AnalysisRepository(
         if (!openAi.hasApiKey) {
             error("Add an OpenAI API key in Settings before generating an AI assessment.")
         }
+        val normalizedFocus = coachingFocus.normalized()
         val submittedFrames = selectEvidenceFrames(current)
+        onProgress(AiAssessmentStage.PREPARING_IMAGES)
         val exportedFrames = exportEvidenceFrames(runDir, current, submittedFrames)
-        val assessmentPayload = assessmentPayload(current, submittedFrames)
-        val content = openAiClient.generate(openAi, assessmentPayload, exportedFrames, onDraft)
+        val assessmentPayload = assessmentPayload(current, submittedFrames, normalizedFocus)
+        onProgress(AiAssessmentStage.SENDING_REQUEST)
+        val content = openAiClient.generate(
+            openAi,
+            assessmentPayload,
+            exportedFrames,
+            onProgress = onProgress,
+            onDraft = onDraft,
+        )
+        onProgress(AiAssessmentStage.SAVING_ASSESSMENT)
         validateFrameReferences(content, submittedFrames)
-        val fingerprint = evidenceFingerprint(current, submittedFrames)
+        val fingerprint = evidenceFingerprint(current, submittedFrames, normalizedFocus)
         val assessment = LlmAssessmentDto(
             schemaVersion = SCHEMA_VERSION,
             promptVersion = PROMPT_VERSION,
@@ -296,6 +329,7 @@ class AnalysisRepository(
             submittedFrames = submittedFrames,
             qualitySnapshot = qualitySnapshot(current),
             evidenceFingerprint = fingerprint,
+            coachingFocus = normalizedFocus,
             content = content,
         )
         val updated = current.copy(
@@ -305,6 +339,7 @@ class AnalysisRepository(
             llmAssessmentEligibilityIssue = null,
         )
         writeResult(runDir, updated)
+        settings.saveCoachingFocus(normalizedFocus)
         updated
     }
 
@@ -313,6 +348,8 @@ class AnalysisRepository(
     fun saveOpenAiSettings(openAiSettings: OpenAiSettings) {
         settings.saveOpenAiSettings(openAiSettings)
     }
+
+    fun coachingFocus(): CoachingFocusDto = settings.coachingFocus()
 
     suspend fun cachedArtifact(
         runId: String,
@@ -481,7 +518,11 @@ class AnalysisRepository(
         val issue = llmEligibilityIssue(result)
         val current = result.llmAssessment != null &&
             issue == null &&
-            result.llmAssessment.evidenceFingerprint == evidenceFingerprint(result)
+            result.llmAssessment.promptVersion == PROMPT_VERSION &&
+            result.llmAssessment.evidenceFingerprint == evidenceFingerprint(
+                result,
+                coachingFocus = result.llmAssessment.coachingFocus,
+            )
         return result.copy(
             llmAssessmentCurrent = current,
             llmAssessmentStale = result.llmAssessment != null && !current,
@@ -529,18 +570,7 @@ class AnalysisRepository(
         reviewPhaseNames(result).forEach { phaseName ->
             if (phaseName == SwingPhases.ADDRESS_PHASE) return@forEach
             val phase = byName.getValue(phaseName)
-            val offsets = if (
-                phaseName in setOf(
-                    SwingPhases.TOP_PHASE,
-                    SwingPhases.P6_PHASE,
-                    SwingPhases.IMPACT_PHASE,
-                    SwingPhases.FINISH_PHASE,
-                )
-            ) {
-                listOf(-neighborFrames, 0, neighborFrames)
-            } else {
-                listOf(0)
-            }
+            val offsets = evidenceFrameOffsets(phaseName, neighborFrames)
             offsets.forEach { offset ->
                 val actualIndex = (phase.frameIndex + offset).coerceIn(address, finish)
                 val actualOffset = (actualIndex - phase.frameIndex) / fps.coerceAtLeast(1e-9)
@@ -587,14 +617,17 @@ class AnalysisRepository(
         val original = File(Uri.parse(result.artifactUrls.getValue("original_video")).path.orEmpty())
         require(original.isFile) { "The original replay required for AI assessment is unavailable." }
         val evidenceDir = File(runDir, "llm_frames").apply { mkdirs() }
+        val profileFile = File(evidenceDir, EVIDENCE_IMAGE_PROFILE_FILE)
+        val cacheIsCurrent = runCatching { profileFile.readText() == EVIDENCE_IMAGE_PROFILE }.getOrDefault(false)
         val preparedFrames = submittedFrames.map { evidenceFrame ->
             val destination = File(evidenceDir, evidenceFrame.imageFile)
             require(destination.parentFile == evidenceDir && destination.name == evidenceFrame.imageFile) {
                 "Invalid AI evidence image path."
             }
-            val cachedJpeg = runCatching { destination.readBytes() }
+            val cachedJpeg = if (cacheIsCurrent) runCatching { destination.readBytes() }
                 .getOrNull()
                 ?.takeIf(::isUsableEvidenceJpeg)
+            else null
             val jpeg = cachedJpeg ?: exportEvidenceJpeg(original, evidenceFrame)
             Triple(evidenceFrame, destination, jpeg)
         }
@@ -618,6 +651,7 @@ class AnalysisRepository(
         evidenceDir.listFiles { file -> file.name.startsWith("frame_") && file.extension == "jpg" }
             ?.filterNot { it.name in expectedNames }
             ?.forEach { it.delete() }
+        AtomicTextFile.write(profileFile, EVIDENCE_IMAGE_PROFILE)
 
         return preparedFrames.map { (evidenceFrame, _, jpeg) ->
             ExportedEvidenceFrame(
@@ -631,11 +665,23 @@ class AnalysisRepository(
         original: File,
         evidenceFrame: SubmittedEvidenceFrameDto,
     ): ByteArray {
-        val bitmap = decodeEvidenceBitmap(original, evidenceFrame)
+        val sourceBitmap = decodeEvidenceBitmap(original, evidenceFrame)
             ?: error("Unable to export AI evidence frame ${evidenceFrame.frameIndex} after retrying the video decoder.")
+        val largestDimension = max(sourceBitmap.width, sourceBitmap.height)
+        val bitmap = if (largestDimension > MAX_EVIDENCE_IMAGE_DIMENSION) {
+            val scale = MAX_EVIDENCE_IMAGE_DIMENSION.toDouble() / largestDimension
+            Bitmap.createScaledBitmap(
+                sourceBitmap,
+                (sourceBitmap.width * scale).roundToInt().coerceAtLeast(1),
+                (sourceBitmap.height * scale).roundToInt().coerceAtLeast(1),
+                true,
+            ).also { sourceBitmap.recycle() }
+        } else {
+            sourceBitmap
+        }
         return try {
             ByteArrayOutputStream().use { output ->
-                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)) {
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, EVIDENCE_JPEG_QUALITY, output)) {
                     "Unable to encode AI evidence frame ${evidenceFrame.frameIndex}."
                 }
                 output.toByteArray()
@@ -688,12 +734,14 @@ class AnalysisRepository(
     private fun assessmentPayload(
         result: AnalysisResultResponse,
         submittedFrames: List<SubmittedEvidenceFrameDto>,
+        coachingFocus: CoachingFocusDto,
     ): JsonObject = buildJsonObject {
         put("context", json.encodeToJsonElement(result.context))
         put("quality", JsonObject(qualitySnapshot(result)))
         put("phases", json.encodeToJsonElement(result.phases))
         put("submitted_frames", json.encodeToJsonElement(submittedFrames))
         put("measurements", measurements(result))
+        put("coaching_focus", json.encodeToJsonElement(coachingFocus))
     }
 
     private fun qualitySnapshot(result: AnalysisResultResponse): Map<String, JsonElement> {
@@ -714,7 +762,7 @@ class AnalysisRepository(
                 buildJsonObject {
                     put("metric_key", key)
                     put("name", metric.name)
-                    metric.value?.let { put("value", it) }
+                    metric.value?.let { put("value", roundedMeasurement(it)) }
                     metric.unit?.let { put("unit", it) }
                     metric.description?.let { put("description", it) }
                     metric.frameIndex?.let { put("frame_index", it) }
@@ -726,6 +774,7 @@ class AnalysisRepository(
     private fun evidenceFingerprint(
         result: AnalysisResultResponse,
         submittedFrames: List<SubmittedEvidenceFrameDto> = selectEvidenceFrames(result),
+        coachingFocus: CoachingFocusDto? = null,
     ): String {
         val payload = buildJsonObject {
             put("context", json.encodeToJsonElement(result.context))
@@ -733,6 +782,7 @@ class AnalysisRepository(
             put("submitted_frames", json.encodeToJsonElement(submittedFrames))
             put("metrics", measurements(result))
             put("quality", JsonObject(qualitySnapshot(result)))
+            coachingFocus?.let { put("coaching_focus", json.encodeToJsonElement(it.normalized())) }
         }.toString()
         val digest = MessageDigest.getInstance("SHA-256").digest(payload.toByteArray(Charsets.UTF_8))
         return digest.joinToString("") { byte -> "%02x".format(byte) }
@@ -804,9 +854,13 @@ class AnalysisRepository(
         private const val JOB_FILE = "job.json"
         private const val CANCEL_FILE = "cancel.requested"
         private const val PERFORMANCE_FILE = "performance.json"
-        private const val SCHEMA_VERSION = "1.0.0"
-        private const val PROMPT_VERSION = "1.0.0"
+        private const val SCHEMA_VERSION = "1.1.0"
+        private const val PROMPT_VERSION = "1.3.0"
         private const val NEIGHBOR_SECONDS = 0.1
+        private const val EVIDENCE_IMAGE_PROFILE = "key-phase-neighbors-1280-q88-v1"
+        private const val EVIDENCE_IMAGE_PROFILE_FILE = "image_profile.txt"
+        private const val MAX_EVIDENCE_IMAGE_DIMENSION = 1_280
+        private const val EVIDENCE_JPEG_QUALITY = 88
         private val SUPERSEDED_PHASE_METHODS = setOf(
             "minimum_wrist_y_coordinate",
             "closest_wrist_return_to_address_after_top",

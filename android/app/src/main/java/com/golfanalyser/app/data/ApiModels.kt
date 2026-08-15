@@ -155,6 +155,20 @@ data class LlmContentDraft(
             } || limitations.any(String::isNotBlank)
 }
 
+enum class AiAssessmentStage(val step: Int) {
+    PREPARING_IMAGES(1),
+    SENDING_REQUEST(2),
+    ANALYSING_SWING(3),
+    WRITING_ADVICE(4),
+    SAVING_ASSESSMENT(5),
+}
+
+@Serializable
+data class CoachingFocusDto(
+    val goals: List<String> = emptyList(),
+    @SerialName("custom_note") val customNote: String? = null,
+)
+
 @Serializable
 data class LlmAssessmentDto(
     @SerialName("schema_version") val schemaVersion: String,
@@ -165,6 +179,7 @@ data class LlmAssessmentDto(
     @SerialName("submitted_frames") val submittedFrames: List<SubmittedEvidenceFrameDto> = emptyList(),
     @SerialName("quality_snapshot") val qualitySnapshot: Map<String, JsonElement> = emptyMap(),
     @SerialName("evidence_fingerprint") val evidenceFingerprint: String? = null,
+    @SerialName("coaching_focus") val coachingFocus: CoachingFocusDto? = null,
     val content: LlmContentDto,
 )
 

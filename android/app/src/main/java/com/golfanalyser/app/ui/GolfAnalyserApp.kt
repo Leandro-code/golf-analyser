@@ -1,11 +1,15 @@
 package com.golfanalyser.app.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -34,6 +38,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -53,6 +58,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -71,15 +79,24 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.golfanalyser.app.data.AnalysisResultResponse
+import com.golfanalyser.app.data.AiAssessmentStage
 import com.golfanalyser.app.data.AssessmentFindingDto
 import com.golfanalyser.app.data.ContextPayload
+import com.golfanalyser.app.data.COACHING_FOCUS_OPTIONS
+import com.golfanalyser.app.data.CoachingFocusDto
+import com.golfanalyser.app.data.MAX_COACHING_GOALS
+import com.golfanalyser.app.data.MAX_COACHING_NOTE_LENGTH
 import com.golfanalyser.app.analysis.LandmarkFrame
 import com.golfanalyser.app.analysis.LandmarkPoint
 import com.golfanalyser.app.data.LlmAssessmentDto
 import com.golfanalyser.app.data.LlmContentDraft
+import com.golfanalyser.app.data.LlmPriorityDto
 import com.golfanalyser.app.data.MetricDto
 import com.golfanalyser.app.data.SwingPhaseDto
 import com.golfanalyser.app.data.confidenceLabel
+import com.golfanalyser.app.data.displayLines
+import com.golfanalyser.app.data.formatPracticeAdvice
+import com.golfanalyser.app.data.normalized
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -164,7 +181,7 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    "Import a full swing, add capture details, then generate an AI assessment from measured pose evidence.",
+                    "Import a full swing, add capture details, then generate personalised AI coaching.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.secondary,
                 )
@@ -382,10 +399,13 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
             onDismissRequest = { pendingAiRequest = null },
             title = { Text(if (force) "Regenerate AI assessment?" else "Send evidence to OpenAI?") },
             text = {
-                Text(
-                    "Selected swing still images, capture context, local pose measurements, and quality metadata " +
-                        "will be sent over HTTPS to OpenAI. The full video is not uploaded.",
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Selected swing images, capture context, local movement measurements, quality metadata, " +
+                            "and your coaching focus will be sent over HTTPS to OpenAI. The full video is not uploaded.",
+                    )
+                    Text("Focus: ${state.coachingFocus.displayLines().joinToString(" · ").ifBlank { "General coaching" }}")
+                }
             },
             confirmButton = {
                 Button(
@@ -445,33 +465,19 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
                 AiAssessmentCard(
                     result = result,
                     isGenerating = state.isGeneratingAi,
+                    stage = state.aiAssessmentStage,
                     draft = state.aiAssessmentDraft,
                     hasApiKey = state.hasSavedOpenAiApiKey,
                     viewModel = viewModel,
-                    onGenerate = { requestAiAssessment(false) },
+                    coachingFocus = state.coachingFocus,
+                    onGenerate = requestAiAssessment,
                 )
             }
             item {
-                ActionRow(
-                    onPhaseReview = viewModel::openPhaseReview,
-                    onGenerateAi = {
-                        if (!state.hasSavedOpenAiApiKey) {
-                            viewModel.showSettings()
-                        } else if (result.llmAssessmentCurrent) {
-                            requestAiAssessment(true)
-                        } else {
-                            requestAiAssessment(false)
-                        }
-                    },
-                    aiButtonText = when {
-                        !state.hasSavedOpenAiApiKey -> "Add API key"
-                        result.llmAssessmentCurrent -> "Regenerate AI"
-                        else -> "AI assessment"
-                    },
-                    aiEnabled = !state.isGeneratingAi && (
-                        !state.hasSavedOpenAiApiKey || result.llmAssessmentEligibilityIssue == null
-                    ),
-                )
+                OutlinedButton(
+                    onClick = viewModel::openPhaseReview,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Review phase timing") }
             }
             item {
                 MeasurementsCard(result.metricsSummary)
@@ -684,38 +690,224 @@ private val SKELETON_CONNECTIONS = listOf(
 )
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun AiAssessmentCard(
     result: AnalysisResultResponse,
     isGenerating: Boolean,
+    stage: AiAssessmentStage?,
     draft: LlmContentDraft?,
     hasApiKey: Boolean,
     viewModel: AppViewModel,
-    onGenerate: () -> Unit,
+    coachingFocus: CoachingFocusDto,
+    onGenerate: (Boolean) -> Unit,
 ) {
+    val context = LocalContext.current
+    var copied by remember(result.runId, result.llmAssessment?.evidenceFingerprint) { mutableStateOf(false) }
+    val assessment = if (result.llmAssessmentCurrent) result.llmAssessment else null
+    var editingFocus by remember(result.runId, assessment?.evidenceFingerprint) {
+        mutableStateOf(assessment == null)
+    }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(2_000)
+            copied = false
+        }
+    }
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("AI Swing Assessment", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            val assessment = if (result.llmAssessmentCurrent) result.llmAssessment else null
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    "AI Swing Assessment",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                if (assessment != null) {
+                    TextButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(
+                                ClipData.newPlainText("Golf practice advice", formatPracticeAdvice(assessment)),
+                            )
+                            copied = true
+                        },
+                    ) {
+                        Icon(
+                            if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
+                            contentDescription = null,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (copied) "Copied" else "Copy")
+                    }
+                }
+            }
+            CoachingFocusSection(
+                focus = coachingFocus,
+                savedFocus = assessment?.coachingFocus,
+                editing = editingFocus,
+                enabled = !isGenerating,
+                onEditChange = { editingFocus = it },
+                onToggle = viewModel::toggleCoachingGoal,
+                onNoteChange = viewModel::updateCoachingNote,
+            )
             when {
-                isGenerating -> AiAssessmentLoading(draft, assessment, viewModel::cancelAiAssessment)
-                result.llmAssessmentStale -> WarningBanner("Saved AI assessment is stale. Regenerate after reviewing timing.")
-                assessment == null && !hasApiKey -> MissingApiKeyPrompt(viewModel::showSettings)
+                isGenerating -> AiAssessmentLoading(stage, draft, assessment, viewModel::cancelAiAssessment)
+                !hasApiKey -> MissingApiKeyPrompt(viewModel::showSettings)
                 result.llmAssessmentEligibilityIssue != null -> {
                     WarningBanner(result.llmAssessmentEligibilityIssue)
                     Button(onClick = viewModel::openPhaseReview, modifier = Modifier.fillMaxWidth()) {
                         Text("Review phase timing")
                     }
                 }
+                result.llmAssessmentStale -> {
+                    WarningBanner("Saved AI assessment is stale. Regenerate it to use the latest swing evidence.")
+                    Button(
+                        onClick = { onGenerate(true) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Regenerate assessment") }
+                }
                 assessment == null -> {
                     Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
                     Button(
-                        onClick = onGenerate,
+                        onClick = { onGenerate(false) },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text("Generate AI assessment")
                     }
                 }
-                else -> LlmAssessmentContent(assessment)
+                else -> {
+                    LlmAssessmentContent(assessment = assessment)
+                    Button(
+                        onClick = { onGenerate(true) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            if (coachingFocus.normalized() != (assessment.coachingFocus ?: CoachingFocusDto()).normalized()) {
+                                "Regenerate with this focus"
+                            } else {
+                                "Regenerate assessment"
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CoachingFocusEditor(
+    focus: CoachingFocusDto,
+    enabled: Boolean,
+    onToggle: (String) -> Unit,
+    onNoteChange: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Choose up to $MAX_COACHING_GOALS goals. These guide the advice and are not treated as measured ball flight.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.secondary,
+        )
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            COACHING_FOCUS_OPTIONS.forEach { option ->
+                val selected = option.key in focus.goals
+                FilterChip(
+                    selected = selected,
+                    onClick = { onToggle(option.key) },
+                    label = { Text(option.label) },
+                    enabled = enabled && (selected || focus.goals.size < MAX_COACHING_GOALS),
+                )
+            }
+        }
+        OutlinedTextField(
+            value = focus.customNote.orEmpty(),
+            onValueChange = onNoteChange,
+            label = { Text("Optional note") },
+            placeholder = { Text("e.g. I usually miss right with my irons") },
+            supportingText = { Text("${focus.customNote.orEmpty().length}/$MAX_COACHING_NOTE_LENGTH") },
+            enabled = enabled,
+            minLines = 2,
+            maxLines = 4,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CoachingFocusSection(
+    focus: CoachingFocusDto,
+    savedFocus: CoachingFocusDto?,
+    editing: Boolean,
+    enabled: Boolean,
+    onEditChange: (Boolean) -> Unit,
+    onToggle: (String) -> Unit,
+    onNoteChange: (String) -> Unit,
+) {
+    if (editing) {
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("Tailor your coaching", fontWeight = FontWeight.Bold)
+                    if (savedFocus != null) {
+                        TextButton(onClick = { onEditChange(false) }, enabled = enabled) {
+                            Text("Done")
+                        }
+                    }
+                }
+                CoachingFocusEditor(
+                    focus = focus,
+                    enabled = enabled,
+                    onToggle = onToggle,
+                    onNoteChange = onNoteChange,
+                )
+                if (savedFocus != null && focus.normalized() != savedFocus.normalized()) {
+                    Text(
+                        "Your changes will apply when you regenerate the assessment.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        }
+    } else {
+        val lines = focus.normalized().displayLines()
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Coaching focus", fontWeight = FontWeight.Bold)
+                    Text(
+                        lines.firstOrNull() ?: "General coaching",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    lines.drop(1).firstOrNull()?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                TextButton(onClick = { onEditChange(true) }, enabled = enabled) { Text("Edit") }
             }
         }
     }
@@ -744,10 +936,34 @@ private fun MissingApiKeyPrompt(onOpenSettings: () -> Unit) {
 
 @Composable
 private fun AiAssessmentLoading(
+    stage: AiAssessmentStage?,
     draft: LlmContentDraft?,
     previousAssessment: LlmAssessmentDto?,
     onCancel: () -> Unit,
 ) {
+    val currentStage = stage ?: AiAssessmentStage.PREPARING_IMAGES
+    val stageTitle = when (currentStage) {
+        AiAssessmentStage.PREPARING_IMAGES -> "Preparing swing images"
+        AiAssessmentStage.SENDING_REQUEST -> "Sending swing data securely"
+        AiAssessmentStage.ANALYSING_SWING -> "Reviewing your swing"
+        AiAssessmentStage.WRITING_ADVICE -> "Writing your coaching plan"
+        AiAssessmentStage.SAVING_ASSESSMENT -> "Saving your assessment"
+    }
+    val stageDescription = when (currentStage) {
+        AiAssessmentStage.PREPARING_IMAGES ->
+            "Selecting and optimising the key moments for review."
+        AiAssessmentStage.SENDING_REQUEST ->
+            "Uploading the selected images and measurements."
+        AiAssessmentStage.ANALYSING_SWING ->
+            "Comparing movement across the swing. This is usually the longest step."
+        AiAssessmentStage.WRITING_ADVICE -> if (draft?.hasVisibleContent == true) {
+            "Your personalised advice is arriving below."
+        } else {
+            "Turning the swing observations into clear practice priorities."
+        }
+        AiAssessmentStage.SAVING_ASSESSMENT ->
+            "Checking the finished advice and saving it to this analysis."
+    }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -761,19 +977,17 @@ private fun AiAssessmentLoading(
             )
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    if (previousAssessment == null) "Generating AI assessment" else "Regenerating AI assessment",
+                    stageTitle,
                     fontWeight = FontWeight.Bold,
                 )
-                Text(
-                    if (draft?.hasVisibleContent == true) {
-                        "The report below is still being generated."
-                    } else {
-                        "Preparing swing evidence and waiting for the model response."
-                    },
-                )
+                Text("Step ${currentStage.step} of ${AiAssessmentStage.entries.size}")
+                Text(stageDescription)
             }
         }
-        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        LinearProgressIndicator(
+            progress = { currentStage.step.toFloat() / AiAssessmentStage.entries.size },
+            modifier = Modifier.fillMaxWidth(),
+        )
         OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
             Text("Cancel AI generation")
         }
@@ -815,20 +1029,135 @@ private fun LlmAssessmentDraftContent(draft: LlmContentDraft) {
 }
 
 @Composable
-private fun LlmAssessmentContent(assessment: LlmAssessmentDto) {
+private fun LlmAssessmentContent(
+    assessment: LlmAssessmentDto,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(assessment.content.overview)
-        assessment.content.priorities.forEachIndexed { index, priority ->
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("${index + 1}. ${priority.title} (${confidenceLabel(priority.confidence)})", fontWeight = FontWeight.Bold)
-                Text(priority.rationale)
-                InfoBanner("Practice cue: ${priority.practiceCue}")
-                AssessmentBulletList("Drills", priority.drills)
-                AssessmentBulletList("Plan", priority.practicePlan)
+        SelectionContainer {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(assessment.content.overview)
+                if (assessment.content.priorities.isNotEmpty()) {
+                    Text("Your practice priorities", fontWeight = FontWeight.Bold)
+                }
+                assessment.content.priorities.forEachIndexed { index, priority ->
+                    PracticePriorityCard(index + 1, priority)
+                }
             }
         }
-        AssessmentBulletList("Strengths", assessment.content.strengths)
-        AssessmentBulletList("Limitations", assessment.content.limitations)
+        ExpandableTextSection("Strengths", assessment.content.strengths)
+        ExpandableTextSection(
+            "Other observations",
+            assessment.content.observations.map { "${it.title}: ${it.observation}" },
+        )
+        ExpandableTextSection("Limitations", assessment.content.limitations)
+    }
+}
+
+@Composable
+private fun PracticePriorityCard(number: Int, priority: LlmPriorityDto) {
+    var expanded by remember(priority.title, priority.rationale) { mutableStateOf(false) }
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("$number. ${priority.title}", fontWeight = FontWeight.Bold)
+            Text(
+                priority.rationale,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFE4F1EC))) {
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        "Practice cue",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        priority.practiceCue,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            val firstDrill = priority.drills.firstOrNull(String::isNotBlank)
+            val firstSteps = priority.practicePlan.filter(String::isNotBlank).take(3)
+            if (firstDrill != null || firstSteps.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Try this", fontWeight = FontWeight.Bold)
+                    firstDrill?.let {
+                        Text("• $it", maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                    firstSteps.forEachIndexed { index, step ->
+                        Text(
+                            "${index + 1}. $step",
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+            TextButton(onClick = { expanded = !expanded }) {
+                Text(if (expanded) "Hide details" else "Show details")
+            }
+            if (expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Full rationale", fontWeight = FontWeight.Bold)
+                    Text(priority.rationale)
+                    Text("Practice cue", fontWeight = FontWeight.Bold)
+                    Text(priority.practiceCue)
+                    priority.explanation?.takeIf(String::isNotBlank)?.let {
+                        Text("Why this matters", fontWeight = FontWeight.Bold)
+                        Text(it)
+                    }
+                    if (priority.drills.any(String::isNotBlank)) {
+                        AssessmentBulletList("Drills", priority.drills)
+                    }
+                    if (priority.practicePlan.any(String::isNotBlank)) {
+                        AssessmentBulletList("Practice steps", priority.practicePlan)
+                    }
+                    Text(
+                        "Confidence: ${confidenceLabel(priority.confidence)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExpandableTextSection(title: String, items: List<String>) {
+    val visibleItems = items.filter(String::isNotBlank)
+    if (visibleItems.isEmpty()) return
+    var expanded by remember(title, visibleItems) { mutableStateOf(false) }
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    "$title (${visibleItems.size})",
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(if (expanded) "Hide" else "Show")
+            }
+            if (expanded) {
+                SelectionContainer {
+                    Column(
+                        modifier = Modifier.padding(bottom = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        visibleItems.forEach { Text("• $it") }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -853,27 +1182,10 @@ private fun AssessmentBulletList(label: String, items: List<String>) {
 }
 
 @Composable
-private fun ActionRow(
-    onPhaseReview: () -> Unit,
-    onGenerateAi: () -> Unit,
-    aiButtonText: String,
-    aiEnabled: Boolean,
-) {
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-        OutlinedButton(onClick = onPhaseReview, modifier = Modifier.weight(1f)) {
-            Text("Review timing")
-        }
-        Button(onClick = onGenerateAi, enabled = aiEnabled, modifier = Modifier.weight(1f)) {
-            Text(aiButtonText)
-        }
-    }
-}
-
-@Composable
 private fun MeasurementsCard(metrics: Map<String, MetricDto>) {
     Card {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Measured pose data", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text("Measured swing data", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             metrics.values.take(8).forEach { metric ->
                 Text("${metric.name}: ${metric.value.displayValue()} ${metric.unit.orEmpty()}")
             }
@@ -1015,11 +1327,12 @@ private fun Banner(message: String, background: Color, foreground: Color) {
 
 private fun String.readable(): String = replace('_', ' ').replaceFirstChar { it.titlecase() }
 
-private fun kotlinx.serialization.json.JsonElement?.displayValue(): String {
+internal fun kotlinx.serialization.json.JsonElement?.displayValue(): String {
     val primitive = this as? JsonPrimitive ?: return toString()
-    return primitive.contentOrNull
-        ?: primitive.intOrNull?.toString()
-        ?: primitive.doubleOrNull?.toString()
+    return if (primitive.isString) {
+        primitive.content
+    } else primitive.intOrNull?.toString()
+        ?: primitive.doubleOrNull?.let { java.util.Locale.US.let { locale -> String.format(locale, "%.2f", it) } }
         ?: primitive.booleanOrNull?.toString()
         ?: primitive.toString()
 }

@@ -9,12 +9,16 @@ import com.golfanalyser.app.data.AnalysisResultResponse
 import com.golfanalyser.app.data.AnalysisStatusResponse
 import com.golfanalyser.app.data.AnalysisStorageUsage
 import com.golfanalyser.app.data.AnalysisWorkCoordinator
+import com.golfanalyser.app.data.AiAssessmentStage
 import com.golfanalyser.app.data.ArtifactCache
 import com.golfanalyser.app.data.ContextPayload
+import com.golfanalyser.app.data.CoachingFocusDto
 import com.golfanalyser.app.data.LlmContentDraft
 import com.golfanalyser.app.data.OpenAiSettings
 import com.golfanalyser.app.data.openAiErrorMessage
 import com.golfanalyser.app.data.buildPhaseConfirmationPayload
+import com.golfanalyser.app.data.normalized
+import com.golfanalyser.app.data.toggle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -60,7 +64,9 @@ data class AppUiState(
     val replayState: ReplayState = ReplayState.NotLoaded,
     val isBusy: Boolean = false,
     val isGeneratingAi: Boolean = false,
+    val aiAssessmentStage: AiAssessmentStage? = null,
     val aiAssessmentDraft: LlmContentDraft? = null,
+    val coachingFocus: CoachingFocusDto = CoachingFocusDto(),
     val message: String? = null,
     val error: String? = null,
 )
@@ -86,11 +92,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         val openAi = repository.openAiSettings()
+        val coachingFocus = repository.coachingFocus()
         _uiState.update {
             it.copy(
                 openAiApiKey = openAi.apiKey,
                 openAiModel = openAi.model,
                 hasSavedOpenAiApiKey = openAi.hasApiKey,
+                coachingFocus = coachingFocus,
             )
         }
         resumePendingAnalysis()
@@ -194,6 +202,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 isBusy = false,
                 isGeneratingAi = false,
                 aiAssessmentDraft = null,
+                coachingFocus = result.llmAssessment
+                    ?.let { it.coachingFocus ?: CoachingFocusDto() }
+                    ?: repository.coachingFocus(),
                 error = null,
                 message = null,
             )
@@ -410,6 +421,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         startAiAssessment(force = false)
     }
 
+    fun toggleCoachingGoal(goal: String) {
+        if (_uiState.value.isGeneratingAi) return
+        _uiState.update { it.copy(coachingFocus = it.coachingFocus.toggle(goal)) }
+    }
+
+    fun updateCoachingNote(note: String) {
+        if (_uiState.value.isGeneratingAi) return
+        _uiState.update {
+            it.copy(coachingFocus = it.coachingFocus.copy(customNote = note).normalized())
+        }
+    }
+
     fun regenerateAiAssessment() {
         startAiAssessment(force = true)
     }
@@ -438,25 +461,45 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update {
                     it.copy(
                         isGeneratingAi = true,
+                        aiAssessmentStage = AiAssessmentStage.PREPARING_IMAGES,
                         aiAssessmentDraft = null,
                         error = null,
                         message = "$action AI assessment...",
                     )
                 }
-                val updated = repository.createLlmAssessment(runId, force = force) { draft ->
-                    _uiState.update { state ->
-                        if (state.result?.runId == runId && state.isGeneratingAi) {
-                            state.copy(aiAssessmentDraft = draft)
-                        } else {
-                            state
+                val focus = _uiState.value.coachingFocus.normalized()
+                val updated = repository.createLlmAssessment(
+                    runId = runId,
+                    coachingFocus = focus,
+                    force = force,
+                    onProgress = { stage ->
+                        _uiState.update { state ->
+                            if (state.result?.runId == runId && state.isGeneratingAi) {
+                                state.copy(aiAssessmentStage = stage)
+                            } else {
+                                state
+                            }
                         }
-                    }
-                }
+                    },
+                    onDraft = { draft ->
+                        _uiState.update { state ->
+                            if (state.result?.runId == runId && state.isGeneratingAi) {
+                                state.copy(
+                                    aiAssessmentStage = AiAssessmentStage.WRITING_ADVICE,
+                                    aiAssessmentDraft = draft,
+                                )
+                            } else {
+                                state
+                            }
+                        }
+                    },
+                )
                 _uiState.update {
                     if (it.result?.runId == runId) {
                         it.copy(
                             result = updated,
                             isGeneratingAi = false,
+                            aiAssessmentStage = null,
                             aiAssessmentDraft = null,
                             message = "AI assessment $completedAction.",
                             error = null,
@@ -472,6 +515,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (it.result?.runId == runId) {
                         it.copy(
                             isGeneratingAi = false,
+                            aiAssessmentStage = null,
                             aiAssessmentDraft = null,
                             error = openAiErrorMessage(throwable),
                             message = null,
@@ -493,7 +537,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         aiGenerationJob = null
         _uiState.update {
             if (it.isGeneratingAi || it.aiAssessmentDraft != null) {
-                it.copy(isGeneratingAi = false, aiAssessmentDraft = null)
+                it.copy(isGeneratingAi = false, aiAssessmentStage = null, aiAssessmentDraft = null)
             } else {
                 it
             }
