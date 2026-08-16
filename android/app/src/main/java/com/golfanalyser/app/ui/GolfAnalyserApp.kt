@@ -1062,11 +1062,7 @@ private fun PracticePriorityCard(number: Int, priority: LlmPriorityDto) {
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text("$number. ${priority.title}", fontWeight = FontWeight.Bold)
-            Text(
-                priority.rationale,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Text(priority.rationale)
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFE4F1EC))) {
                 Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
@@ -1075,11 +1071,7 @@ private fun PracticePriorityCard(number: Int, priority: LlmPriorityDto) {
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary,
                     )
-                    Text(
-                        priority.practiceCue,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    Text(priority.practiceCue)
                 }
             }
             val firstDrill = priority.drills.firstOrNull(String::isNotBlank)
@@ -1088,14 +1080,10 @@ private fun PracticePriorityCard(number: Int, priority: LlmPriorityDto) {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Try this", fontWeight = FontWeight.Bold)
                     firstDrill?.let {
-                        Text("• $it", maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text("• $it")
                     }
                     firstSteps.forEachIndexed { index, step ->
-                        Text(
-                            "${index + 1}. $step",
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        Text("${index + 1}. $step")
                     }
                 }
             }
