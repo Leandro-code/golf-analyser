@@ -49,12 +49,39 @@ class ApiModelTest {
                 "prompt_version": "1.0.0",
                 "model": "test-model",
                 "generated_at": "2026-06-21T00:00:00Z",
+                "context": {
+                  "handedness": "right",
+                  "camera_view": "face_on",
+                  "club_family": "iron",
+                  "swing_type": "full_swing"
+                },
                 "submitted_frames": [],
+                "quality_snapshot": {
+                  "phase_scoped_metrics": true
+                },
+                "evidence_fingerprint": "abc123",
+                "coaching_focus": {
+                  "goals": ["reduce_fade_or_slice"],
+                  "custom_note": "Work on the iron fade"
+                },
                 "content": {
                   "overview": "Grounded overview",
                   "strengths": [],
                   "observations": [],
-                  "priorities": [],
+                  "priorities": [
+                    {
+                      "title": "Keep posture stable",
+                      "rationale": "Supported by frame evidence.",
+                      "practice_cue": "Hold posture",
+                      "explanation": null,
+                      "drills": [],
+                      "practice_plan": [],
+                      "supporting_frame_ids": [],
+                      "related_metric_keys": [],
+                      "confidence": 0.7,
+                      "support_type": "ai_generated"
+                    }
+                  ],
                   "limitations": []
                 }
               },
@@ -72,6 +99,33 @@ class ApiModelTest {
         assertEquals("face_on", result.context?.cameraView)
         assertEquals("Address", result.phases.single().name)
         assertEquals("Grounded overview", result.llmAssessment?.content?.overview)
+        assertEquals("abc123", result.llmAssessment?.evidenceFingerprint)
+        assertEquals(listOf("reduce_fade_or_slice"), result.llmAssessment?.coachingFocus?.goals)
+        assertEquals("Work on the iron fade", result.llmAssessment?.coachingFocus?.customNote)
+        assertEquals("ai_generated", result.llmAssessment?.content?.priorities?.single()?.supportType)
         assertTrue(result.llmAssessmentCurrent)
+    }
+
+    @Test
+    fun parsesLegacyAiAssessmentWithoutCoachingFocus() {
+        val assessment = json.decodeFromString<LlmAssessmentDto>(
+            """{
+                "schema_version":"1.0.0",
+                "prompt_version":"1.0.0",
+                "model":"legacy-model",
+                "generated_at":"2026-06-21T00:00:00Z",
+                "evidence_fingerprint":"legacy-fingerprint",
+                "content":{
+                    "overview":"Legacy assessment",
+                    "strengths":[],
+                    "observations":[],
+                    "priorities":[],
+                    "limitations":[]
+                }
+            }""".trimIndent(),
+        )
+
+        assertEquals(null, assessment.coachingFocus)
+        assertEquals("legacy-fingerprint", assessment.evidenceFingerprint)
     }
 }

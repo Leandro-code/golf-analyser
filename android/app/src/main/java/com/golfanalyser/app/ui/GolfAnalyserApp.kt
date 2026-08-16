@@ -1,14 +1,21 @@
 package com.golfanalyser.app.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -17,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,11 +32,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -42,16 +52,22 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -63,12 +79,25 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.golfanalyser.app.data.AnalysisResultResponse
+import com.golfanalyser.app.data.AiAssessmentStage
 import com.golfanalyser.app.data.AssessmentFindingDto
 import com.golfanalyser.app.data.ContextPayload
+import com.golfanalyser.app.data.COACHING_FOCUS_OPTIONS
+import com.golfanalyser.app.data.CoachingFocusDto
+import com.golfanalyser.app.data.MAX_COACHING_GOALS
+import com.golfanalyser.app.data.MAX_COACHING_NOTE_LENGTH
+import com.golfanalyser.app.analysis.LandmarkFrame
+import com.golfanalyser.app.analysis.LandmarkPoint
 import com.golfanalyser.app.data.LlmAssessmentDto
+import com.golfanalyser.app.data.LlmContentDraft
+import com.golfanalyser.app.data.LlmPriorityDto
 import com.golfanalyser.app.data.MetricDto
 import com.golfanalyser.app.data.SwingPhaseDto
 import com.golfanalyser.app.data.confidenceLabel
+import com.golfanalyser.app.data.displayLines
+import com.golfanalyser.app.data.formatPracticeAdvice
+import com.golfanalyser.app.data.normalized
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
@@ -89,10 +118,11 @@ fun GolfAnalyserApp(viewModel: AppViewModel = viewModel()) {
         Surface(modifier = Modifier.fillMaxSize()) {
             when (state.screen) {
                 Screen.NewSwing -> NewSwingScreen(state, viewModel)
-                Screen.Processing -> ProcessingScreen(state)
+                Screen.Processing -> ProcessingScreen(state, viewModel)
                 Screen.Result -> ResultScreen(state, viewModel)
                 Screen.History -> HistoryScreen(state, viewModel)
                 Screen.PhaseReview -> PhaseReviewScreen(state, viewModel)
+                Screen.Settings -> SettingsScreen(state, viewModel)
             }
         }
     }
@@ -132,7 +162,10 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
     }
     AppScaffold(
         title = "New swing",
-        actions = { TextButton(onClick = viewModel::loadHistory) { Text("History") } },
+        actions = {
+            TextButton(onClick = viewModel::showSettings) { Text("Settings") }
+            TextButton(onClick = viewModel::loadHistory) { Text("History") }
+        },
     ) { padding ->
         LazyColumn(
             modifier = Modifier
@@ -148,10 +181,13 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    "Import a full swing, add capture details, then generate an AI assessment from measured pose evidence.",
+                    "Import a full swing, add capture details, then generate personalised AI coaching.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.secondary,
                 )
+            }
+            if (!state.hasSavedOpenAiApiKey) {
+                item { MissingApiKeyCard(viewModel::showSettings) }
             }
             item {
                 Button(
@@ -174,9 +210,13 @@ private fun NewSwingScreen(state: AppUiState, viewModel: AppViewModel) {
                     enabled = !state.isBusy,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    if (state.isBusy) CircularProgressIndicator(modifier = Modifier.height(18.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (state.isBusy) "Uploading..." else "Analyse swing")
+                    if (state.isBusy) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Preparing...")
+                    } else {
+                        Text("Analyse swing")
+                    }
                 }
             }
         }
@@ -208,16 +248,21 @@ private fun ContextControls(context: ContextPayload, onChange: (ContextPayload) 
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ChipGroup(label: String, value: String, options: List<String>, onChange: (String) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(label, style = MaterialTheme.typography.labelLarge)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             options.forEach { option ->
                 FilterChip(
                     selected = option == value,
                     onClick = { onChange(option) },
-                    label = { Text(option.readable()) },
+                    label = { Text(option.readable(), maxLines = 1) },
                 )
             }
         }
@@ -225,7 +270,7 @@ private fun ChipGroup(label: String, value: String, options: List<String>, onCha
 }
 
 @Composable
-private fun ProcessingScreen(state: AppUiState) {
+private fun ProcessingScreen(state: AppUiState, viewModel: AppViewModel) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -240,16 +285,54 @@ private fun ProcessingScreen(state: AppUiState) {
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(state.status?.message ?: state.message ?: "Processing swing")
+            OutlinedButton(onClick = viewModel::cancelPoseAnalysis) {
+                Text("Cancel analysis")
+            }
         }
     }
 }
 
 @Composable
 private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
+    var runToDelete by remember { mutableStateOf<String?>(null) }
+    var confirmDeleteAll by remember { mutableStateOf(false) }
+    runToDelete?.let { runId ->
+        AlertDialog(
+            onDismissRequest = { runToDelete = null },
+            title = { Text("Delete this analysis?") },
+            text = { Text("The saved video, pose data, extracted frames, and assessment will be permanently removed.") },
+            confirmButton = {
+                Button(onClick = { runToDelete = null; viewModel.deleteAnalysis(runId) }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { runToDelete = null }) { Text("Cancel") } },
+        )
+    }
+    if (confirmDeleteAll) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteAll = false },
+            title = { Text("Delete all local data?") },
+            text = {
+                Text(
+                    "This permanently removes every saved analysis, video, extracted frame, AI assessment, " +
+                        "and the API key stored in Settings.",
+                )
+            },
+            confirmButton = {
+                Button(onClick = { confirmDeleteAll = false; viewModel.deleteAllLocalData() }) {
+                    Text("Delete everything")
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteAll = false }) { Text("Cancel") } },
+        )
+    }
     AppScaffold(
         title = "Saved analyses",
         actions = {
-            TextButton(onClick = viewModel::clearDownloadedReplays) { Text("Clear replays") }
+            TextButton(onClick = viewModel::showSettings) { Text("Settings") }
+            TextButton(
+                onClick = { confirmDeleteAll = true },
+                enabled = !state.isBusy && (state.storageUsage.analysisCount > 0 || state.hasSavedOpenAiApiKey),
+            ) { Text("Delete all") }
             TextButton(onClick = viewModel::showNewSwing) { Text("New") }
         },
     ) { padding ->
@@ -262,13 +345,36 @@ private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
         ) {
             if (state.isBusy) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
             if (state.error != null) item { ErrorBanner(state.error) }
+            if (state.message != null) item { InfoBanner(state.message) }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Local storage", fontWeight = FontWeight.Bold)
+                        Text(
+                            "${formatBytes(state.storageUsage.totalBytes)} used by " +
+                                "${state.storageUsage.analysisCount} saved " +
+                                if (state.storageUsage.analysisCount == 1) "analysis" else "analyses",
+                        )
+                    }
+                }
+            }
             items(state.history) { result ->
                 Card(onClick = { viewModel.openHistoryResult(result.runId) }) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(result.runId, fontWeight = FontWeight.Bold)
                         Text(result.context?.let { "${it.cameraView.readable()} / ${it.clubFamily.readable()}" } ?: "Legacy run")
+                        Text(
+                            formatBytes(state.storageUsage.bytesByRunId[result.runId] ?: 0L),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                        )
                         if (result.llmAssessmentCurrent) Text("AI assessment ready", color = MaterialTheme.colorScheme.primary)
                         if (result.llmAssessmentStale) Text("AI assessment is stale", color = Color(0xFF8A3B12))
+                        OutlinedButton(
+                            onClick = { runToDelete = result.runId },
+                            enabled = !state.isBusy,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Delete analysis") }
                     }
                 }
             }
@@ -279,9 +385,56 @@ private fun HistoryScreen(state: AppUiState, viewModel: AppViewModel) {
 @Composable
 private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
     val result = state.result ?: return
+    var pendingAiRequest by remember(result.runId) { mutableStateOf<Boolean?>(null) }
+    var confirmDelete by remember(result.runId) { mutableStateOf(false) }
+    val requestAiAssessment: (Boolean) -> Unit = { force ->
+        if (!state.hasSavedOpenAiApiKey) {
+            viewModel.showSettings()
+        } else {
+            pendingAiRequest = force
+        }
+    }
+    pendingAiRequest?.let { force ->
+        AlertDialog(
+            onDismissRequest = { pendingAiRequest = null },
+            title = { Text(if (force) "Regenerate AI assessment?" else "Send evidence to OpenAI?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Selected swing images, capture context, local movement measurements, quality metadata, " +
+                            "and your coaching focus will be sent over HTTPS to OpenAI. The full video is not uploaded.",
+                    )
+                    Text("Focus: ${state.coachingFocus.displayLines().joinToString(" · ").ifBlank { "General coaching" }}")
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingAiRequest = null
+                        if (force) viewModel.regenerateAiAssessment() else viewModel.generateAiAssessment()
+                    },
+                ) { Text("Send and generate") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingAiRequest = null }) { Text("Cancel") }
+            },
+        )
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete this analysis?") },
+            text = { Text("The saved video, pose data, extracted frames, and assessment will be permanently removed.") },
+            confirmButton = {
+                Button(onClick = { confirmDelete = false; viewModel.deleteAnalysis(result.runId) }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+    }
     AppScaffold(
         title = "Swing analysis",
         actions = {
+            TextButton(onClick = viewModel::showSettings) { Text("Settings") }
             TextButton(onClick = viewModel::loadHistory) { Text("History") }
             TextButton(onClick = viewModel::showNewSwing) { Text("New") }
         },
@@ -294,22 +447,37 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             item {
-                ReplayPanel(state.replayState, viewModel::retryReplayDownload)
+                ReplayPanel(state.replayState, result, viewModel::retryReplayDownload)
             }
             item {
                 ResultHeader(result)
             }
+            item {
+                OutlinedButton(
+                    onClick = { confirmDelete = true },
+                    enabled = !state.isBusy && !state.isGeneratingAi,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Delete analysis") }
+            }
             if (state.error != null) item { ErrorBanner(state.error) }
             if (state.message != null) item { InfoBanner(state.message) }
             item {
-                AiAssessmentCard(result, state.isGeneratingAi, viewModel)
+                AiAssessmentCard(
+                    result = result,
+                    isGenerating = state.isGeneratingAi,
+                    stage = state.aiAssessmentStage,
+                    draft = state.aiAssessmentDraft,
+                    hasApiKey = state.hasSavedOpenAiApiKey,
+                    viewModel = viewModel,
+                    coachingFocus = state.coachingFocus,
+                    onGenerate = requestAiAssessment,
+                )
             }
             item {
-                ActionRow(
-                    onPhaseReview = viewModel::openPhaseReview,
-                    onGenerateAi = viewModel::generateAiAssessment,
-                    aiEnabled = result.llmAssessmentEligibilityIssue == null && !state.isGeneratingAi,
-                )
+                OutlinedButton(
+                    onClick = viewModel::openPhaseReview,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Review phase timing") }
             }
             item {
                 MeasurementsCard(result.metricsSummary)
@@ -324,8 +492,20 @@ private fun ResultScreen(state: AppUiState, viewModel: AppViewModel) {
     }
 }
 
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1_024) return "$bytes B"
+    val units = listOf("KB", "MB", "GB", "TB")
+    var value = bytes.toDouble()
+    var unitIndex = -1
+    while (value >= 1_024 && unitIndex < units.lastIndex) {
+        value /= 1_024
+        unitIndex += 1
+    }
+    return if (value >= 10) "${value.toInt()} ${units[unitIndex]}" else "${"%.1f".format(value)} ${units[unitIndex]}"
+}
+
 @Composable
-private fun ReplayPanel(replayState: ReplayState, onRetry: () -> Unit) {
+private fun ReplayPanel(replayState: ReplayState, result: AnalysisResultResponse, onRetry: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -362,7 +542,7 @@ private fun ReplayPanel(replayState: ReplayState, onRetry: () -> Unit) {
                     }
                 }
             }
-            is ReplayState.Ready -> VideoPlayer(replayState.uri)
+            is ReplayState.Ready -> VideoPlayer(replayState.uri, result)
         }
     }
 }
@@ -382,13 +562,20 @@ private fun ResultHeader(result: AnalysisResultResponse) {
 }
 
 @Composable
-private fun VideoPlayer(url: String) {
+private fun VideoPlayer(url: String, result: AnalysisResultResponse) {
     val context = LocalContext.current
     var videoAspectRatio by remember(url) { mutableStateOf(9f / 16f) }
+    var currentPositionMs by remember(url) { mutableStateOf(0L) }
     val player = remember(url) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(url))
             prepare()
+        }
+    }
+    LaunchedEffect(player) {
+        while (true) {
+            currentPositionMs = player.currentPosition
+            delay(80)
         }
     }
     DisposableEffect(player) {
@@ -406,63 +593,377 @@ private fun VideoPlayer(url: String) {
             player.release()
         }
     }
-    AndroidView(
+    Box(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(videoAspectRatio)
             .background(Color.Black),
-        factory = {
-            PlayerView(it).apply {
-                this.player = player
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                )
-            }
-        },
-        update = {
-            it.player = player
-            it.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-        },
-    )
+    ) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = {
+                PlayerView(it).apply {
+                    this.player = player
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                }
+            },
+            update = {
+                it.player = player
+                it.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+            },
+        )
+        PoseOverlay(
+            result = result,
+            currentPositionMs = currentPositionMs,
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
 }
 
 @Composable
-private fun AiAssessmentCard(result: AnalysisResultResponse, isGenerating: Boolean, viewModel: AppViewModel) {
+private fun PoseOverlay(
+    result: AnalysisResultResponse,
+    currentPositionMs: Long,
+    modifier: Modifier = Modifier,
+) {
+    val fps = result.metadata?.get("fps")?.let { (it as? JsonPrimitive)?.doubleOrNull } ?: 30.0
+    val frameIndex = ((currentPositionMs / 1000.0) * fps).toInt()
+    val frame = result.landmarks.minByOrNull { kotlin.math.abs(it.frameIndex - frameIndex) }
+        ?.takeIf { it.poseDetected }
+    val phase = result.phases.minByOrNull { kotlin.math.abs(it.frameIndex - frameIndex) }
+    Canvas(modifier = modifier) {
+        if (frame == null) return@Canvas
+        val points = frame.landmarks.associateBy { it.name }
+        SKELETON_CONNECTIONS.forEach { (first, second) ->
+            val a = points[first]
+            val b = points[second]
+            if (a != null && b != null) {
+                drawLine(
+                    color = Color(0xFFE7F5E8),
+                    start = a.offset(size.width, size.height),
+                    end = b.offset(size.width, size.height),
+                    strokeWidth = 4f,
+                )
+            }
+        }
+        points.values.forEach { point ->
+            drawCircle(
+                color = Color(0xFF75D0A2),
+                radius = 5f,
+                center = point.offset(size.width, size.height),
+                style = Stroke(width = 2f),
+            )
+        }
+        phase?.takeIf { kotlin.math.abs(it.frameIndex - frame.frameIndex) <= maxOf(1, fps.toInt() / 12) }?.let {
+            drawCircle(
+                color = Color(0xFFFFD166),
+                radius = 14f,
+                center = points["left_wrist"]?.offset(size.width, size.height)
+                    ?: points["right_wrist"]?.offset(size.width, size.height)
+                    ?: return@let,
+                style = Stroke(width = 4f),
+            )
+        }
+    }
+}
+
+private fun LandmarkPoint.offset(width: Float, height: Float) =
+    androidx.compose.ui.geometry.Offset((x * width).toFloat(), (y * height).toFloat())
+
+private val SKELETON_CONNECTIONS = listOf(
+    "left_shoulder" to "right_shoulder",
+    "left_shoulder" to "left_elbow",
+    "left_elbow" to "left_wrist",
+    "right_shoulder" to "right_elbow",
+    "right_elbow" to "right_wrist",
+    "left_shoulder" to "left_hip",
+    "right_shoulder" to "right_hip",
+    "left_hip" to "right_hip",
+    "left_hip" to "left_knee",
+    "left_knee" to "left_ankle",
+    "right_hip" to "right_knee",
+    "right_knee" to "right_ankle",
+)
+
+@Composable
+@OptIn(ExperimentalLayoutApi::class)
+private fun AiAssessmentCard(
+    result: AnalysisResultResponse,
+    isGenerating: Boolean,
+    stage: AiAssessmentStage?,
+    draft: LlmContentDraft?,
+    hasApiKey: Boolean,
+    viewModel: AppViewModel,
+    coachingFocus: CoachingFocusDto,
+    onGenerate: (Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    var copied by remember(result.runId, result.llmAssessment?.evidenceFingerprint) { mutableStateOf(false) }
+    val assessment = if (result.llmAssessmentCurrent) result.llmAssessment else null
+    var editingFocus by remember(result.runId, assessment?.evidenceFingerprint) {
+        mutableStateOf(assessment == null)
+    }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(2_000)
+            copied = false
+        }
+    }
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("AI Swing Assessment", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            val assessment = if (result.llmAssessmentCurrent) result.llmAssessment else null
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    "AI Swing Assessment",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                if (assessment != null) {
+                    TextButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(
+                                ClipData.newPlainText("Golf practice advice", formatPracticeAdvice(assessment)),
+                            )
+                            copied = true
+                        },
+                    ) {
+                        Icon(
+                            if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
+                            contentDescription = null,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (copied) "Copied" else "Copy")
+                    }
+                }
+            }
+            CoachingFocusSection(
+                focus = coachingFocus,
+                savedFocus = assessment?.coachingFocus,
+                editing = editingFocus,
+                enabled = !isGenerating,
+                onEditChange = { editingFocus = it },
+                onToggle = viewModel::toggleCoachingGoal,
+                onNoteChange = viewModel::updateCoachingNote,
+            )
             when {
-                result.llmAssessmentStale -> WarningBanner("Saved AI assessment is stale. Regenerate after reviewing timing.")
+                isGenerating -> AiAssessmentLoading(stage, draft, assessment, viewModel::cancelAiAssessment)
+                !hasApiKey -> MissingApiKeyPrompt(viewModel::showSettings)
                 result.llmAssessmentEligibilityIssue != null -> {
                     WarningBanner(result.llmAssessmentEligibilityIssue)
                     Button(onClick = viewModel::openPhaseReview, modifier = Modifier.fillMaxWidth()) {
                         Text("Review phase timing")
                     }
                 }
+                result.llmAssessmentStale -> {
+                    WarningBanner("Saved AI assessment is stale. Regenerate it to use the latest swing evidence.")
+                    Button(
+                        onClick = { onGenerate(true) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Regenerate assessment") }
+                }
                 assessment == null -> {
-                    if (isGenerating) {
-                        AiAssessmentLoading()
-                    } else {
-                        Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
-                        Button(
-                            onClick = viewModel::generateAiAssessment,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("Generate AI assessment")
+                    Text("Generate a model-written report from selected stills, local pose measurements, and quality checks.")
+                    Button(
+                        onClick = { onGenerate(false) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Generate AI assessment")
+                    }
+                }
+                else -> {
+                    LlmAssessmentContent(assessment = assessment)
+                    Button(
+                        onClick = { onGenerate(true) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            if (coachingFocus.normalized() != (assessment.coachingFocus ?: CoachingFocusDto()).normalized()) {
+                                "Regenerate with this focus"
+                            } else {
+                                "Regenerate assessment"
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CoachingFocusEditor(
+    focus: CoachingFocusDto,
+    enabled: Boolean,
+    onToggle: (String) -> Unit,
+    onNoteChange: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Choose up to $MAX_COACHING_GOALS goals. These guide the advice and are not treated as measured ball flight.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.secondary,
+        )
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            COACHING_FOCUS_OPTIONS.forEach { option ->
+                val selected = option.key in focus.goals
+                FilterChip(
+                    selected = selected,
+                    onClick = { onToggle(option.key) },
+                    label = { Text(option.label) },
+                    enabled = enabled && (selected || focus.goals.size < MAX_COACHING_GOALS),
+                )
+            }
+        }
+        OutlinedTextField(
+            value = focus.customNote.orEmpty(),
+            onValueChange = onNoteChange,
+            label = { Text("Optional note") },
+            placeholder = { Text("e.g. I usually miss right with my irons") },
+            supportingText = { Text("${focus.customNote.orEmpty().length}/$MAX_COACHING_NOTE_LENGTH") },
+            enabled = enabled,
+            minLines = 2,
+            maxLines = 4,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CoachingFocusSection(
+    focus: CoachingFocusDto,
+    savedFocus: CoachingFocusDto?,
+    editing: Boolean,
+    enabled: Boolean,
+    onEditChange: (Boolean) -> Unit,
+    onToggle: (String) -> Unit,
+    onNoteChange: (String) -> Unit,
+) {
+    if (editing) {
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("Tailor your coaching", fontWeight = FontWeight.Bold)
+                    if (savedFocus != null) {
+                        TextButton(onClick = { onEditChange(false) }, enabled = enabled) {
+                            Text("Done")
                         }
                     }
                 }
-                else -> LlmAssessmentContent(assessment)
+                CoachingFocusEditor(
+                    focus = focus,
+                    enabled = enabled,
+                    onToggle = onToggle,
+                    onNoteChange = onNoteChange,
+                )
+                if (savedFocus != null && focus.normalized() != savedFocus.normalized()) {
+                    Text(
+                        "Your changes will apply when you regenerate the assessment.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        }
+    } else {
+        val lines = focus.normalized().displayLines()
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Coaching focus", fontWeight = FontWeight.Bold)
+                    Text(
+                        lines.firstOrNull() ?: "General coaching",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    lines.drop(1).firstOrNull()?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                TextButton(onClick = { onEditChange(true) }, enabled = enabled) { Text("Edit") }
             }
         }
     }
 }
 
 @Composable
-private fun AiAssessmentLoading() {
+private fun MissingApiKeyCard(onOpenSettings: () -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3D8))) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            MissingApiKeyPrompt(onOpenSettings)
+        }
+    }
+}
+
+@Composable
+private fun MissingApiKeyPrompt(onOpenSettings: () -> Unit) {
+    Text("OpenAI API key required", fontWeight = FontWeight.Bold, color = Color(0xFF70410E))
+    Text(
+        "Add your API key in Settings before generating an AI swing assessment.",
+        color = Color(0xFF70410E),
+    )
+    Button(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) {
+        Text("Open Settings")
+    }
+}
+
+@Composable
+private fun AiAssessmentLoading(
+    stage: AiAssessmentStage?,
+    draft: LlmContentDraft?,
+    previousAssessment: LlmAssessmentDto?,
+    onCancel: () -> Unit,
+) {
+    val currentStage = stage ?: AiAssessmentStage.PREPARING_IMAGES
+    val stageTitle = when (currentStage) {
+        AiAssessmentStage.PREPARING_IMAGES -> "Preparing swing images"
+        AiAssessmentStage.SENDING_REQUEST -> "Sending swing data securely"
+        AiAssessmentStage.ANALYSING_SWING -> "Reviewing your swing"
+        AiAssessmentStage.WRITING_ADVICE -> "Writing your coaching plan"
+        AiAssessmentStage.SAVING_ASSESSMENT -> "Saving your assessment"
+    }
+    val stageDescription = when (currentStage) {
+        AiAssessmentStage.PREPARING_IMAGES ->
+            "Selecting and optimising the key moments for review."
+        AiAssessmentStage.SENDING_REQUEST ->
+            "Uploading the selected images and measurements."
+        AiAssessmentStage.ANALYSING_SWING ->
+            "Comparing movement across the swing. This is usually the longest step."
+        AiAssessmentStage.WRITING_ADVICE -> if (draft?.hasVisibleContent == true) {
+            "Your personalised advice is arriving below."
+        } else {
+            "Turning the swing observations into clear practice priorities."
+        }
+        AiAssessmentStage.SAVING_ASSESSMENT ->
+            "Checking the finished advice and saving it to this analysis."
+    }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -475,47 +976,195 @@ private fun AiAssessmentLoading() {
                 strokeWidth = 3.dp,
             )
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Generating AI assessment", fontWeight = FontWeight.Bold)
-                Text("Preparing swing evidence and waiting for the model response.")
+                Text(
+                    stageTitle,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text("Step ${currentStage.step} of ${AiAssessmentStage.entries.size}")
+                Text(stageDescription)
             }
         }
-        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        Text("This can take about a minute for the first request.")
+        LinearProgressIndicator(
+            progress = { currentStage.step.toFloat() / AiAssessmentStage.entries.size },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
+            Text("Cancel AI generation")
+        }
+        if (draft?.hasVisibleContent == true) {
+            LlmAssessmentDraftContent(draft)
+        } else if (previousAssessment != null) {
+            Text("The current assessment will remain saved until its replacement is ready.")
+            LlmAssessmentContent(previousAssessment)
+        } else {
+            Text("This can take about a minute for the first request.")
+        }
     }
 }
 
 @Composable
-private fun LlmAssessmentContent(assessment: LlmAssessmentDto) {
+private fun LlmAssessmentDraftContent(draft: LlmContentDraft) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(assessment.content.overview)
-        assessment.content.priorities.forEachIndexed { index, priority ->
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("${index + 1}. ${priority.title} (${confidenceLabel(priority.confidence)})", fontWeight = FontWeight.Bold)
-                Text(priority.rationale)
-                InfoBanner("Practice cue: ${priority.practiceCue}")
-                if (priority.drills.isNotEmpty()) Text("Drills: ${priority.drills.joinToString("; ")}")
-                if (priority.practicePlan.isNotEmpty()) Text("Plan: ${priority.practicePlan.joinToString("; ")}")
+        if (draft.overview.isNotBlank()) Text(draft.overview)
+        draft.priorities.forEachIndexed { index, priority ->
+            if (
+                priority.title.isNotBlank() || priority.rationale.isNotBlank() ||
+                priority.practiceCue.isNotBlank() || priority.drills.isNotEmpty() ||
+                priority.practicePlan.isNotEmpty()
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (priority.title.isNotBlank()) {
+                        Text("${index + 1}. ${priority.title}", fontWeight = FontWeight.Bold)
+                    }
+                    if (priority.rationale.isNotBlank()) Text(priority.rationale)
+                    if (priority.practiceCue.isNotBlank()) InfoBanner("Practice cue: ${priority.practiceCue}")
+                    AssessmentBulletList("Drills", priority.drills)
+                    AssessmentBulletList("Plan", priority.practicePlan)
+                }
             }
         }
-        if (assessment.content.strengths.isNotEmpty()) {
-            Text("Strengths", fontWeight = FontWeight.Bold)
-            assessment.content.strengths.forEach { Text("• $it") }
+        AssessmentBulletList("Strengths", draft.strengths)
+        AssessmentBulletList("Limitations", draft.limitations)
+    }
+}
+
+@Composable
+private fun LlmAssessmentContent(
+    assessment: LlmAssessmentDto,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        SelectionContainer {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(assessment.content.overview)
+                if (assessment.content.priorities.isNotEmpty()) {
+                    Text("Your practice priorities", fontWeight = FontWeight.Bold)
+                }
+                assessment.content.priorities.forEachIndexed { index, priority ->
+                    PracticePriorityCard(index + 1, priority)
+                }
+            }
         }
-        if (assessment.content.limitations.isNotEmpty()) {
-            Text("Limitations", fontWeight = FontWeight.Bold)
-            assessment.content.limitations.forEach { Text("• $it") }
+        ExpandableTextSection("Strengths", assessment.content.strengths)
+        ExpandableTextSection(
+            "Other observations",
+            assessment.content.observations.map { "${it.title}: ${it.observation}" },
+        )
+        ExpandableTextSection("Limitations", assessment.content.limitations)
+    }
+}
+
+@Composable
+private fun PracticePriorityCard(number: Int, priority: LlmPriorityDto) {
+    var expanded by remember(priority.title, priority.rationale) { mutableStateOf(false) }
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("$number. ${priority.title}", fontWeight = FontWeight.Bold)
+            Text(priority.rationale)
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFE4F1EC))) {
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        "Practice cue",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(priority.practiceCue)
+                }
+            }
+            val firstDrill = priority.drills.firstOrNull(String::isNotBlank)
+            val firstSteps = priority.practicePlan.filter(String::isNotBlank).take(3)
+            if (firstDrill != null || firstSteps.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Try this", fontWeight = FontWeight.Bold)
+                    firstDrill?.let {
+                        Text("• $it")
+                    }
+                    firstSteps.forEachIndexed { index, step ->
+                        Text("${index + 1}. $step")
+                    }
+                }
+            }
+            TextButton(onClick = { expanded = !expanded }) {
+                Text(if (expanded) "Hide details" else "Show details")
+            }
+            if (expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Full rationale", fontWeight = FontWeight.Bold)
+                    Text(priority.rationale)
+                    Text("Practice cue", fontWeight = FontWeight.Bold)
+                    Text(priority.practiceCue)
+                    priority.explanation?.takeIf(String::isNotBlank)?.let {
+                        Text("Why this matters", fontWeight = FontWeight.Bold)
+                        Text(it)
+                    }
+                    if (priority.drills.any(String::isNotBlank)) {
+                        AssessmentBulletList("Drills", priority.drills)
+                    }
+                    if (priority.practicePlan.any(String::isNotBlank)) {
+                        AssessmentBulletList("Practice steps", priority.practicePlan)
+                    }
+                    Text(
+                        "Confidence: ${confidenceLabel(priority.confidence)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun ActionRow(onPhaseReview: () -> Unit, onGenerateAi: () -> Unit, aiEnabled: Boolean) {
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-        OutlinedButton(onClick = onPhaseReview, modifier = Modifier.weight(1f)) {
-            Text("Review timing")
+private fun ExpandableTextSection(title: String, items: List<String>) {
+    val visibleItems = items.filter(String::isNotBlank)
+    if (visibleItems.isEmpty()) return
+    var expanded by remember(title, visibleItems) { mutableStateOf(false) }
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F5FA))) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    "$title (${visibleItems.size})",
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(if (expanded) "Hide" else "Show")
+            }
+            if (expanded) {
+                SelectionContainer {
+                    Column(
+                        modifier = Modifier.padding(bottom = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        visibleItems.forEach { Text("• $it") }
+                    }
+                }
+            }
         }
-        Button(onClick = onGenerateAi, enabled = aiEnabled, modifier = Modifier.weight(1f)) {
-            Text("AI assessment")
+    }
+}
+
+@Composable
+private fun AssessmentBulletList(label: String, items: List<String>) {
+    val visibleItems = items.filter(String::isNotBlank)
+    if (visibleItems.isNotEmpty()) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(label, fontWeight = FontWeight.Bold)
+            visibleItems.forEach { item ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    Text("\u2022")
+                    Spacer(Modifier.width(8.dp))
+                    Text(item, modifier = Modifier.weight(1f))
+                }
+            }
         }
     }
 }
@@ -524,7 +1173,7 @@ private fun ActionRow(onPhaseReview: () -> Unit, onGenerateAi: () -> Unit, aiEna
 private fun MeasurementsCard(metrics: Map<String, MetricDto>) {
     Card {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Measured pose data", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text("Measured swing data", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             metrics.values.take(8).forEach { metric ->
                 Text("${metric.name}: ${metric.value.displayValue()} ${metric.unit.orEmpty()}")
             }
@@ -594,6 +1243,56 @@ private fun PhaseReviewScreen(state: AppUiState, viewModel: AppViewModel) {
 }
 
 @Composable
+private fun SettingsScreen(state: AppUiState, viewModel: AppViewModel) {
+    AppScaffold(
+        title = "Settings",
+        actions = { TextButton(onClick = viewModel::closeSettings) { Text("Done") } },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text("AI provider", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            OutlinedTextField(
+                value = state.openAiApiKey,
+                onValueChange = viewModel::updateOpenAiApiKey,
+                label = { Text("OpenAI API key") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                if (state.hasSavedOpenAiApiKey) {
+                    "An API key is configured. Saving an empty value removes it."
+                } else {
+                    "No API key is configured. Your key is stored in app settings on this device."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            Text(
+                "Assessment model: ${state.openAiModel}",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                "The model is fixed to the version tested with image evidence and structured results.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            if (state.message != null) InfoBanner(state.message)
+            if (state.error != null) ErrorBanner(state.error)
+            Button(onClick = viewModel::saveSettings, modifier = Modifier.fillMaxWidth()) {
+                Text("Save settings")
+            }
+        }
+    }
+}
+
+@Composable
 private fun ErrorBanner(message: String) = Banner(message, Color(0xFFF8E8E2), Color(0xFF5D2C20))
 
 @Composable
@@ -616,11 +1315,12 @@ private fun Banner(message: String, background: Color, foreground: Color) {
 
 private fun String.readable(): String = replace('_', ' ').replaceFirstChar { it.titlecase() }
 
-private fun kotlinx.serialization.json.JsonElement?.displayValue(): String {
+internal fun kotlinx.serialization.json.JsonElement?.displayValue(): String {
     val primitive = this as? JsonPrimitive ?: return toString()
-    return primitive.contentOrNull
-        ?: primitive.intOrNull?.toString()
-        ?: primitive.doubleOrNull?.toString()
+    return if (primitive.isString) {
+        primitive.content
+    } else primitive.intOrNull?.toString()
+        ?: primitive.doubleOrNull?.let { java.util.Locale.US.let { locale -> String.format(locale, "%.2f", it) } }
         ?: primitive.booleanOrNull?.toString()
         ?: primitive.toString()
 }

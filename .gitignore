@@ -18,3 +18,7 @@ mobile/coverage/
 android/.gradle/
 android/**/build/
 android/local.properties
+android/signing.properties
+android/internal-release.keystore
+android/dist/
+android/device-profile/
